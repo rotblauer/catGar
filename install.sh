@@ -101,7 +101,7 @@ info "Running initial backfill (all available data). This may take a while…"
 if "${INSTALL_DIR}/venv/bin/python" "${INSTALL_DIR}/catgar.py" --backfill; then
     info "Backfill complete!"
 else
-    warn "Backfill finished with errors — check the logs above."
+    warn "Backfill finished with errors — run 'journalctl -u catgar.service' for details."
     warn "The timer is still active; future syncs will resume automatically."
 fi
 

@@ -434,6 +434,7 @@ def main():
                 log.info("Already synced up to %s. Nothing to do.", last)
                 influx.close()
                 return
+
             log.info("Resuming sync from %s (last sync: %s)", start, last)
         else:
             start = today
@@ -453,8 +454,9 @@ def main():
 
     influx.close()
 
-    # Record last successful sync date
-    write_last_sync(end, args.state_file)
+    # Record last successful sync date (only if no errors)
+    if not all_errors:
+        write_last_sync(end, args.state_file)
     log.info("Done. Wrote %d total points across %d day(s).", grand_total, days)
     if all_errors:
         log.warning("Encountered %d error(s) during sync.", len(all_errors))
