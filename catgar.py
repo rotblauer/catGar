@@ -14,6 +14,7 @@ import logging
 import os
 import statistics
 import sys
+from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -1438,8 +1439,6 @@ def query_data_summary(influx_client, bucket, catalog_days):
         - fields: dict mapping field name to list of float values
         - tag_values: dict mapping tag name to Counter of values
     """
-    from collections import Counter
-
     query_api = influx_client.query_api()
     catalog = get_data_catalog()
     summary = {}
@@ -1580,7 +1579,10 @@ def compute_field_stats(values):
 
 
 def _format_stat_value(val):
-    """Format a numeric value for display: ints as ints, floats to 1 decimal."""
+    """Format a numeric value for display: ints as ints, floats to 1 decimal.
+
+    Whole numbers below 1 million are shown without decimals for readability.
+    """
     if val == int(val) and abs(val) < 1_000_000:
         return str(int(val))
     return f"{val:.1f}"

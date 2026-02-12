@@ -6,6 +6,7 @@ import logging
 import os
 import tempfile
 import unittest
+from collections import Counter
 from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
@@ -1044,7 +1045,6 @@ class TestPrintDataSummary(unittest.TestCase):
         self.assertIn("Daily Steps", output)
 
     def test_output_shows_tag_values(self):
-        from collections import Counter
         summary = {
             "activity": {
                 "days_with_data": 3,
