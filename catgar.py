@@ -110,6 +110,41 @@ def _safe_float(val, field_name, measurement):
         )
         return None
 
+
+# Keys that are metadata / non-numeric and should never be treated as fields.
+_IGNORED_GENERIC_KEYS = frozenset({
+    "calendarDate", "startTimestampGMT", "endTimestampGMT",
+    "startTimestampLocal", "endTimestampLocal",
+    "userProfilePK", "startOfDayGMT", "startOfDayLocal",
+    "userDailySummaryId",
+})
+
+
+def _collect_extra_fields(data, known_keys, measurement):
+    """Return a dict of ``{key: float_value}`` for numeric fields in *data*
+    that are not in *known_keys*.
+
+    This allows newly-added Garmin fields to be captured automatically.
+    A log message is emitted once per unknown key so operators can add it
+    to the explicit field map if desired.
+    """
+    extras = {}
+    if not isinstance(data, dict):
+        return extras
+    for key, val in data.items():
+        if key in known_keys or key in _IGNORED_GENERIC_KEYS:
+            continue
+        if val is None or isinstance(val, (dict, list)):
+            continue
+        fval = _safe_float(val, key, measurement)
+        if fval is not None:
+            log.debug(
+                "Discovered extra numeric field '%s'=%s in '%s'",
+                key, fval, measurement,
+            )
+            extras[key] = fval
+    return extras
+
 def build_daily_stats_points(stats, day_str):
     """Convert Garmin daily stats dict into InfluxDB Point objects."""
     points = []
@@ -148,6 +183,10 @@ def build_daily_stats_points(stats, day_str):
                 .field(influx_field, fval)
             )
             points.append(p)
+
+    for key, fval in _collect_extra_fields(stats, set(field_map), "daily_stats").items():
+        p = Point("daily_stats").time(ts, WritePrecision.S).field(key, fval)
+        points.append(p)
 
     return points
 
@@ -208,6 +247,10 @@ def build_sleep_points(sleep_data, day_str):
                     .field(f"score_{score_key}", fval)
                 )
                 points.append(p)
+
+    for key, fval in _collect_extra_fields(summary, set(field_map), "sleep").items():
+        p = Point("sleep").time(ts, WritePrecision.S).field(key, fval)
+        points.append(p)
 
     return points
 
@@ -308,9 +351,12 @@ def build_body_composition_points(body_data, day_str):
         "bodyFat": "body_fat_pct",
         "bodyWater": "body_water_pct",
         "muscleMass": "muscle_mass_grams",
+        "skeletalMuscleMass": "skeletal_muscle_mass_grams",
         "boneMass": "bone_mass_grams",
         "metabolicAge": "metabolic_age",
         "visceralFat": "visceral_fat",
+        "weightChange": "weight_change",
+        "physiqueRating": "physique_rating",
     }
 
     for garmin_key, influx_field in field_map.items():
@@ -325,6 +371,10 @@ def build_body_composition_points(body_data, day_str):
                 .field(influx_field, fval)
             )
             points.append(p)
+
+    for key, fval in _collect_extra_fields(body_data, set(field_map), "body_composition").items():
+        p = Point("body_composition").time(ts, WritePrecision.S).field(key, fval)
+        points.append(p)
 
     return points
 
@@ -357,6 +407,10 @@ def build_respiration_points(resp_data, day_str):
             )
             points.append(p)
 
+    for key, fval in _collect_extra_fields(resp_data, set(field_map), "respiration").items():
+        p = Point("respiration").time(ts, WritePrecision.S).field(key, fval)
+        points.append(p)
+
     return points
 
 
@@ -368,7 +422,8 @@ def build_spo2_points(spo2_data, day_str):
     if not spo2_data:
         return points
 
-    for key in ("averageSpO2", "lowestSpO2", "latestSpO2"):
+    _known_spo2_keys = {"averageSpO2", "lowestSpO2", "latestSpO2"}
+    for key in _known_spo2_keys:
         val = spo2_data.get(key)
         if val is not None:
             fval = _safe_float(val, key, "spo2")
@@ -380,6 +435,404 @@ def build_spo2_points(spo2_data, day_str):
                 .field(key, fval)
             )
             points.append(p)
+
+    for key, fval in _collect_extra_fields(spo2_data, _known_spo2_keys, "spo2").items():
+        p = Point("spo2").time(ts, WritePrecision.S).field(key, fval)
+        points.append(p)
+
+    return points
+
+
+def build_stress_points(stress_data, day_str):
+    """Convert Garmin stress data into InfluxDB Point objects."""
+    points = []
+    ts = datetime.strptime(day_str, "%Y-%m-%d")
+
+    if not stress_data:
+        return points
+
+    field_map = {
+        "avgStressLevel": "avg_stress",
+        "maxStressLevel": "max_stress",
+        "totalStressDuration": "total_stress_duration",
+        "lowStressDuration": "low_stress_duration",
+        "mediumStressDuration": "medium_stress_duration",
+        "highStressDuration": "high_stress_duration",
+        "totalRestStressDuration": "rest_stress_duration",
+    }
+
+    for garmin_key, influx_field in field_map.items():
+        val = stress_data.get(garmin_key)
+        if val is not None:
+            fval = _safe_float(val, garmin_key, "stress")
+            if fval is None:
+                continue
+            p = (
+                Point("stress")
+                .time(ts, WritePrecision.S)
+                .field(influx_field, fval)
+            )
+            points.append(p)
+
+    for key, fval in _collect_extra_fields(stress_data, set(field_map), "stress").items():
+        p = Point("stress").time(ts, WritePrecision.S).field(key, fval)
+        points.append(p)
+
+    return points
+
+
+def build_hrv_points(hrv_data, day_str):
+    """Convert Garmin HRV (Heart Rate Variability) data into InfluxDB Point objects."""
+    points = []
+    ts = datetime.strptime(day_str, "%Y-%m-%d")
+
+    if not hrv_data:
+        return points
+
+    summary = hrv_data.get("hrvSummary", hrv_data)
+
+    field_map = {
+        "weeklyAvg": "weekly_avg",
+        "lastNight": "last_night",
+        "lastNightAvg": "last_night_avg",
+        "lastNight5MinHigh": "last_night_5min_high",
+        "baseline": None,  # nested, handled below
+        "status": None,  # string, skip
+    }
+
+    for garmin_key, influx_field in field_map.items():
+        if influx_field is None:
+            continue
+        val = summary.get(garmin_key)
+        if val is not None:
+            fval = _safe_float(val, garmin_key, "hrv")
+            if fval is None:
+                continue
+            p = (
+                Point("hrv")
+                .time(ts, WritePrecision.S)
+                .field(influx_field, fval)
+            )
+            points.append(p)
+
+    baseline = summary.get("baseline", {})
+    if isinstance(baseline, dict):
+        for bkey in ("lowUpper", "balancedLow", "balancedUpper"):
+            val = baseline.get(bkey)
+            if val is not None:
+                fval = _safe_float(val, f"baseline_{bkey}", "hrv")
+                if fval is not None:
+                    p = (
+                        Point("hrv")
+                        .time(ts, WritePrecision.S)
+                        .field(f"baseline_{bkey}", fval)
+                    )
+                    points.append(p)
+
+    for key, fval in _collect_extra_fields(summary, set(field_map), "hrv").items():
+        p = Point("hrv").time(ts, WritePrecision.S).field(key, fval)
+        points.append(p)
+
+    return points
+
+
+def build_hydration_points(hydration_data, day_str):
+    """Convert Garmin hydration data into InfluxDB Point objects."""
+    points = []
+    ts = datetime.strptime(day_str, "%Y-%m-%d")
+
+    if not hydration_data:
+        return points
+
+    field_map = {
+        "valueInML": "intake_ml",
+        "goalInML": "goal_ml",
+        "sweatLossInML": "sweat_loss_ml",
+    }
+
+    for garmin_key, influx_field in field_map.items():
+        val = hydration_data.get(garmin_key)
+        if val is not None:
+            fval = _safe_float(val, garmin_key, "hydration")
+            if fval is None:
+                continue
+            p = (
+                Point("hydration")
+                .time(ts, WritePrecision.S)
+                .field(influx_field, fval)
+            )
+            points.append(p)
+
+    for key, fval in _collect_extra_fields(hydration_data, set(field_map), "hydration").items():
+        p = Point("hydration").time(ts, WritePrecision.S).field(key, fval)
+        points.append(p)
+
+    return points
+
+
+def build_training_readiness_points(readiness_data, day_str):
+    """Convert Garmin training readiness data into InfluxDB Point objects."""
+    points = []
+    ts = datetime.strptime(day_str, "%Y-%m-%d")
+
+    if not readiness_data:
+        return points
+
+    field_map = {
+        "score": "score",
+        "sleepScore": "sleep_score",
+        "recoveryTime": "recovery_time",
+        "acuteLoad": "acute_load",
+        "hrvStatus": "hrv_status",
+        "trainingLoad": "training_load",
+    }
+
+    for garmin_key, influx_field in field_map.items():
+        val = readiness_data.get(garmin_key)
+        if val is not None:
+            fval = _safe_float(val, garmin_key, "training_readiness")
+            if fval is None:
+                continue
+            p = (
+                Point("training_readiness")
+                .time(ts, WritePrecision.S)
+                .field(influx_field, fval)
+            )
+            points.append(p)
+
+    for key, fval in _collect_extra_fields(readiness_data, set(field_map), "training_readiness").items():
+        p = Point("training_readiness").time(ts, WritePrecision.S).field(key, fval)
+        points.append(p)
+
+    return points
+
+
+def build_training_status_points(status_data, day_str):
+    """Convert Garmin training status data into InfluxDB Point objects."""
+    points = []
+    ts = datetime.strptime(day_str, "%Y-%m-%d")
+
+    if not status_data:
+        return points
+
+    field_map = {
+        "trainingLoadBalance": "load_balance",
+        "ltTimestamp": "lt_timestamp",
+        "vo2MaxValue": "vo2max",
+        "loadFocus": "load_focus",
+        "lactateThresholdHeartRate": "lt_heart_rate",
+        "lactateThresholdSpeed": "lt_speed",
+    }
+
+    for garmin_key, influx_field in field_map.items():
+        val = status_data.get(garmin_key)
+        if val is not None:
+            fval = _safe_float(val, garmin_key, "training_status")
+            if fval is None:
+                continue
+            p = (
+                Point("training_status")
+                .time(ts, WritePrecision.S)
+                .field(influx_field, fval)
+            )
+            points.append(p)
+
+    for key, fval in _collect_extra_fields(status_data, set(field_map), "training_status").items():
+        p = Point("training_status").time(ts, WritePrecision.S).field(key, fval)
+        points.append(p)
+
+    return points
+
+
+def build_max_metrics_points(metrics_data, day_str):
+    """Convert Garmin max metrics (VO2 max, etc.) into InfluxDB Point objects."""
+    points = []
+    ts = datetime.strptime(day_str, "%Y-%m-%d")
+
+    if not metrics_data:
+        return points
+
+    # The response may contain a list of metric entries or a dict wrapper.
+    if isinstance(metrics_data, list):
+        entries = metrics_data
+    elif "maxMetrics" in metrics_data:
+        entries = metrics_data.get("maxMetrics", [])
+    else:
+        entries = [metrics_data]
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+
+        sport = entry.get("sport", entry.get("metricsType", "generic"))
+
+        field_map = {
+            "vo2MaxPreciseValue": "vo2max_precise",
+            "vo2MaxValue": "vo2max",
+            "fitnessAge": "fitness_age",
+            "fitnessAgeDescription": None,  # string
+        }
+
+        has_fields = False
+        p = Point("max_metrics").tag("sport", str(sport)).time(ts, WritePrecision.S)
+
+        for garmin_key, influx_field in field_map.items():
+            if influx_field is None:
+                continue
+            val = entry.get(garmin_key)
+            if val is not None:
+                fval = _safe_float(val, garmin_key, "max_metrics")
+                if fval is None:
+                    continue
+                p = p.field(influx_field, fval)
+                has_fields = True
+
+        for key, fval in _collect_extra_fields(entry, set(field_map) | {"sport", "metricsType"}, "max_metrics").items():
+            p = p.field(key, fval)
+            has_fields = True
+
+        if has_fields:
+            points.append(p)
+
+    return points
+
+
+def build_endurance_score_points(score_data, day_str):
+    """Convert Garmin endurance score data into InfluxDB Point objects."""
+    points = []
+    ts = datetime.strptime(day_str, "%Y-%m-%d")
+
+    if not score_data:
+        return points
+
+    field_map = {
+        "overallScore": "overall_score",
+        "enduranceScore": "endurance_score",
+    }
+
+    for garmin_key, influx_field in field_map.items():
+        val = score_data.get(garmin_key)
+        if val is not None:
+            fval = _safe_float(val, garmin_key, "endurance_score")
+            if fval is None:
+                continue
+            p = (
+                Point("endurance_score")
+                .time(ts, WritePrecision.S)
+                .field(influx_field, fval)
+            )
+            points.append(p)
+
+    for key, fval in _collect_extra_fields(score_data, set(field_map), "endurance_score").items():
+        p = Point("endurance_score").time(ts, WritePrecision.S).field(key, fval)
+        points.append(p)
+
+    return points
+
+
+def build_hill_score_points(score_data, day_str):
+    """Convert Garmin hill score data into InfluxDB Point objects."""
+    points = []
+    ts = datetime.strptime(day_str, "%Y-%m-%d")
+
+    if not score_data:
+        return points
+
+    field_map = {
+        "overallScore": "overall_score",
+        "hillScore": "hill_score",
+    }
+
+    for garmin_key, influx_field in field_map.items():
+        val = score_data.get(garmin_key)
+        if val is not None:
+            fval = _safe_float(val, garmin_key, "hill_score")
+            if fval is None:
+                continue
+            p = (
+                Point("hill_score")
+                .time(ts, WritePrecision.S)
+                .field(influx_field, fval)
+            )
+            points.append(p)
+
+    for key, fval in _collect_extra_fields(score_data, set(field_map), "hill_score").items():
+        p = Point("hill_score").time(ts, WritePrecision.S).field(key, fval)
+        points.append(p)
+
+    return points
+
+
+def build_fitnessage_points(age_data, day_str):
+    """Convert Garmin fitness age data into InfluxDB Point objects."""
+    points = []
+    ts = datetime.strptime(day_str, "%Y-%m-%d")
+
+    if not age_data:
+        return points
+
+    field_map = {
+        "fitnessAge": "fitness_age",
+        "chronologicalAge": "chronological_age",
+        "bmi": "bmi",
+        "healthyBmiTop": "healthy_bmi_top",
+        "healthyBmiBottom": "healthy_bmi_bottom",
+        "vigorousMinutes": "vigorous_minutes",
+        "vigorousMinutesGoal": "vigorous_minutes_goal",
+        "restingHr": "resting_hr",
+        "restingHrGoal": "resting_hr_goal",
+    }
+
+    for garmin_key, influx_field in field_map.items():
+        val = age_data.get(garmin_key)
+        if val is not None:
+            fval = _safe_float(val, garmin_key, "fitness_age")
+            if fval is None:
+                continue
+            p = (
+                Point("fitness_age")
+                .time(ts, WritePrecision.S)
+                .field(influx_field, fval)
+            )
+            points.append(p)
+
+    for key, fval in _collect_extra_fields(age_data, set(field_map), "fitness_age").items():
+        p = Point("fitness_age").time(ts, WritePrecision.S).field(key, fval)
+        points.append(p)
+
+    return points
+
+
+def build_floors_points(floors_data, day_str):
+    """Convert Garmin floors data into InfluxDB Point objects."""
+    points = []
+    ts = datetime.strptime(day_str, "%Y-%m-%d")
+
+    if not floors_data:
+        return points
+
+    field_map = {
+        "floorsAscended": "floors_ascended",
+        "floorsDescended": "floors_descended",
+        "floorsAscendedGoal": "floors_ascended_goal",
+    }
+
+    for garmin_key, influx_field in field_map.items():
+        val = floors_data.get(garmin_key)
+        if val is not None:
+            fval = _safe_float(val, garmin_key, "floors")
+            if fval is None:
+                continue
+            p = (
+                Point("floors")
+                .time(ts, WritePrecision.S)
+                .field(influx_field, fval)
+            )
+            points.append(p)
+
+    for key, fval in _collect_extra_fields(floors_data, set(field_map), "floors").items():
+        p = Point("floors").time(ts, WritePrecision.S).field(key, fval)
+        points.append(p)
 
     return points
 
@@ -486,6 +939,16 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
         ("body composition", lambda: build_body_composition_points(garmin_client.get_body_composition(day_str), day_str)),
         ("respiration", lambda: build_respiration_points(garmin_client.get_respiration_data(day_str), day_str)),
         ("SpO2", lambda: build_spo2_points(garmin_client.get_spo2_data(day_str), day_str)),
+        ("stress", lambda: build_stress_points(garmin_client.get_stress_data(day_str), day_str)),
+        ("HRV", lambda: build_hrv_points(garmin_client.get_hrv_data(day_str), day_str)),
+        ("hydration", lambda: build_hydration_points(garmin_client.get_hydration_data(day_str), day_str)),
+        ("training readiness", lambda: build_training_readiness_points(garmin_client.get_training_readiness(day_str), day_str)),
+        ("training status", lambda: build_training_status_points(garmin_client.get_training_status(day_str), day_str)),
+        ("max metrics", lambda: build_max_metrics_points(garmin_client.get_max_metrics(day_str), day_str)),
+        ("endurance score", lambda: build_endurance_score_points(garmin_client.get_endurance_score(day_str), day_str)),
+        ("hill score", lambda: build_hill_score_points(garmin_client.get_hill_score(day_str), day_str)),
+        ("fitness age", lambda: build_fitnessage_points(garmin_client.get_fitnessage_data(day_str), day_str)),
+        ("floors", lambda: build_floors_points(garmin_client.get_floors(day_str), day_str)),
     ]
 
     for name, collect in collectors:
