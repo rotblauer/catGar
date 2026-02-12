@@ -423,7 +423,7 @@ def build_spo2_points(spo2_data, day_str):
         return points
 
     _known_spo2_keys = {"averageSpO2", "lowestSpO2", "latestSpO2"}
-    for key in ("averageSpO2", "lowestSpO2", "latestSpO2"):
+    for key in _known_spo2_keys:
         val = spo2_data.get(key)
         if val is not None:
             fval = _safe_float(val, key, "spo2")
@@ -652,8 +652,13 @@ def build_max_metrics_points(metrics_data, day_str):
     if not metrics_data:
         return points
 
-    # The response may contain a list of metric entries; use the latest/generic one.
-    entries = metrics_data if isinstance(metrics_data, list) else metrics_data.get("maxMetrics", [metrics_data])
+    # The response may contain a list of metric entries or a dict wrapper.
+    if isinstance(metrics_data, list):
+        entries = metrics_data
+    elif "maxMetrics" in metrics_data:
+        entries = metrics_data.get("maxMetrics", [])
+    else:
+        entries = [metrics_data]
 
     for entry in entries:
         if not isinstance(entry, dict):
@@ -682,7 +687,7 @@ def build_max_metrics_points(metrics_data, day_str):
                 p = p.field(influx_field, fval)
                 has_fields = True
 
-        for key, fval in _collect_extra_fields(entry, set(field_map) | {"sport", "metricsType", "calendarDate"}, "max_metrics").items():
+        for key, fval in _collect_extra_fields(entry, set(field_map) | {"sport", "metricsType"}, "max_metrics").items():
             p = p.field(key, fval)
             has_fields = True
 
