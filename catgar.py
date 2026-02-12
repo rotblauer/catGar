@@ -187,7 +187,7 @@ def build_heart_rate_points(hr_data, day_str):
         for pair in hr_values:
             if not isinstance(pair, (list, tuple)) or len(pair) < 2:
                 continue
-            ts_ms, hr = pair[0], pair[1]
+            ts_ms, hr = pair[:2]
             if hr is None or ts_ms is None:
                 continue
             p = (
@@ -372,8 +372,6 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
         if isinstance(exc, ApiException):
             return False
         resp = getattr(exc, "response", None)
-        if isinstance(exc, HTTPError):
-            return getattr(resp, "status_code", None) == 404
         return getattr(resp, "status_code", None) == 404
 
     collectors = [
