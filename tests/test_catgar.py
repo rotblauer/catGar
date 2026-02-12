@@ -1,6 +1,8 @@
 """Unit tests for catgar data transformation functions."""
 
+import io
 import json
+import logging
 import os
 import tempfile
 import unittest
@@ -29,6 +31,7 @@ from catgar import (
     build_training_status_points,
     ensure_bucket,
     find_oldest_available_date,
+    print_sync_summary,
     read_last_sync,
     write_last_sync,
 )
@@ -709,6 +712,115 @@ class TestExtraFieldsInExistingBuilders(unittest.TestCase):
         data = {"averageSpO2": 96, "newSpo2Metric": 88}
         pts = build_spo2_points(data, "2024-06-01")
         self.assertEqual(len(pts), 2)
+
+
+class TestIgnoredStringFields(unittest.TestCase):
+    """Ensure known string/timestamp fields are silently skipped."""
+
+    def test_daily_stats_ignores_timestamp_and_string_fields(self):
+        """Timestamp and string fields from daily_stats should not produce warnings."""
+        stats = {
+            "totalSteps": 8500,
+            "wellnessStartTimeGmt": "2024-08-14T05:00:00.0",
+            "wellnessStartTimeLocal": "2024-08-14T00:00:00.0",
+            "wellnessEndTimeGmt": "2024-08-15T05:00:00.0",
+            "wellnessEndTimeLocal": "2024-08-15T00:00:00.0",
+            "source": "GARMIN",
+            "stressQualifier": "UNKNOWN",
+            "latestSpo2ReadingTimeGmt": "2024-08-15T03:05:00.0",
+            "latestSpo2ReadingTimeLocal": "2024-08-14T22:05:00.0",
+            "latestRespirationTimeGMT": "2024-08-15T05:00:00.0",
+        }
+        with patch("catgar.log") as mock_log:
+            pts = build_daily_stats_points(stats, "2024-06-01")
+            # Only totalSteps should be captured
+            self.assertEqual(len(pts), 1)
+            mock_log.warning.assert_not_called()
+
+    def test_body_composition_ignores_date_fields(self):
+        """startDate and endDate should not produce warnings."""
+        data = {
+            "weight": 75000,
+            "startDate": "2024-08-14",
+            "endDate": "2024-08-14",
+        }
+        with patch("catgar.log") as mock_log:
+            pts = build_body_composition_points(data, "2024-06-01")
+            self.assertEqual(len(pts), 1)
+            mock_log.warning.assert_not_called()
+
+    def test_respiration_ignores_sleep_timestamp_fields(self):
+        """Sleep timestamp fields in respiration data should not produce warnings."""
+        data = {
+            "avgWakingRespirationValue": 16.0,
+            "tomorrowSleepStartTimestampGMT": "2024-08-15T04:07:00.0",
+            "tomorrowSleepEndTimestampGMT": "2024-08-15T14:24:00.0",
+            "tomorrowSleepStartTimestampLocal": "2024-08-14T23:07:00.0",
+            "tomorrowSleepEndTimestampLocal": "2024-08-15T09:24:00.0",
+        }
+        with patch("catgar.log") as mock_log:
+            pts = build_respiration_points(data, "2024-06-01")
+            self.assertEqual(len(pts), 1)
+            mock_log.warning.assert_not_called()
+
+    def test_spo2_ignores_timestamp_fields(self):
+        """Timestamp fields in SpO2 data should not produce warnings."""
+        data = {
+            "averageSpO2": 96.0,
+            "tomorrowSleepStartTimestampGMT": "2024-08-15T04:07:00.0",
+            "tomorrowSleepEndTimestampGMT": "2024-08-15T14:24:00.0",
+            "tomorrowSleepStartTimestampLocal": "2024-08-14T23:07:00.0",
+            "tomorrowSleepEndTimestampLocal": "2024-08-15T09:24:00.0",
+            "latestSpO2TimestampGMT": "2024-08-15T03:05:00.0",
+            "latestSpO2TimestampLocal": "2024-08-14T22:05:00.0",
+        }
+        with patch("catgar.log") as mock_log:
+            pts = build_spo2_points(data, "2024-06-01")
+            self.assertEqual(len(pts), 1)
+            mock_log.warning.assert_not_called()
+
+    def test_collect_extra_fields_skips_new_ignored_keys(self):
+        """_collect_extra_fields should silently skip all ignored keys."""
+        data = {
+            "numericField": 42,
+            "wellnessStartTimeGmt": "2024-08-14T05:00:00.0",
+            "source": "GARMIN",
+            "startDate": "2024-08-14",
+            "tomorrowSleepStartTimestampGMT": "2024-08-15T04:07:00.0",
+            "latestSpO2TimestampGMT": "2024-08-15T03:05:00.0",
+        }
+        extras = _collect_extra_fields(data, set(), "test")
+        self.assertEqual(list(extras.keys()), ["numericField"])
+
+
+class TestPrintSyncSummary(unittest.TestCase):
+    """Test the TUI summary output."""
+
+    def test_summary_with_data(self):
+        counts = {"daily stats": 67, "sleep": 5, "heart rate": 1440}
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            print_sync_summary(counts, 3, [])
+            output = mock_out.getvalue()
+        self.assertIn("catGar Sync Summary", output)
+        self.assertIn("daily stats", output)
+        self.assertIn("67", output)
+        self.assertIn("1,440", output)
+        self.assertIn("Days synced", output)
+        self.assertIn("3", output)
+
+    def test_summary_with_errors(self):
+        counts = {"daily stats": 10}
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            print_sync_summary(counts, 1, [("sleep", Exception("fail"))])
+            output = mock_out.getvalue()
+        self.assertIn("Errors", output)
+
+    def test_summary_empty_sync(self):
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            print_sync_summary({}, 1, [])
+            output = mock_out.getvalue()
+        self.assertIn("catGar Sync Summary", output)
+        self.assertIn("Total", output)
 
 
 if __name__ == "__main__":
