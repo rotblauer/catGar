@@ -151,10 +151,8 @@ def build_sleep_points(sleep_data, day_str):
 def build_heart_rate_points(hr_data, day_str):
     """Convert Garmin heart-rate data into InfluxDB Point objects."""
     points = []
-    ts = datetime.strptime(day_str, "%Y-%m-%d")
 
     for entry in (hr_data or []):
-        entry_ts = entry.get("startTimestampGMT") or entry.get("startTimestampLocal")
         hr_values = entry.get("heartRateValues")
         if not hr_values:
             continue
