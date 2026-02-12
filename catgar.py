@@ -12,7 +12,9 @@ import argparse
 import json
 import logging
 import os
+import statistics
 import sys
+from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
@@ -1428,17 +1430,338 @@ def print_data_catalog():
     print()
 
 
+def query_data_summary(influx_client, bucket, catalog_days):
+    """Query InfluxDB for actual data presence and statistics per measurement.
+
+    Returns a dict keyed by measurement name with:
+        - days_with_data: number of distinct days containing data
+        - total_points: total point count
+        - fields: dict mapping field name to list of float values
+        - tag_values: dict mapping tag name to Counter of values
+    """
+    query_api = influx_client.query_api()
+    catalog = get_data_catalog()
+    summary = {}
+
+    for cat in catalog:
+        meas = cat["measurement"]
+        entry = {
+            "days_with_data": 0,
+            "total_points": 0,
+            "fields": {},
+            "tag_values": {},
+        }
+
+        # Query field values for the measurement over the last N days
+        for f in cat["fields"]:
+            field_name = f["influx_field"]
+            query = (
+                f'from(bucket: "{bucket}")'
+                f" |> range(start: -{catalog_days}d)"
+                f' |> filter(fn: (r) => r._measurement == "{meas}"'
+                f' and r._field == "{field_name}")'
+                " |> keep(columns: [\"_time\", \"_value\"])"
+            )
+            try:
+                tables = query_api.query(query)
+                values = []
+                for table in tables:
+                    for record in table.records:
+                        v = record.get_value()
+                        if v is not None:
+                            try:
+                                values.append(float(v))
+                            except (ValueError, TypeError):
+                                pass
+                if values:
+                    entry["fields"][field_name] = values
+            except Exception as exc:
+                log.debug("Query error for %s.%s: %s", meas, field_name, exc)
+
+        # Compute days_with_data and total_points from a count query
+        count_query = (
+            f'from(bucket: "{bucket}")'
+            f" |> range(start: -{catalog_days}d)"
+            f' |> filter(fn: (r) => r._measurement == "{meas}")'
+            " |> group()"
+            ' |> count(column: "_value")'
+        )
+        try:
+            tables = query_api.query(count_query)
+            for table in tables:
+                for record in table.records:
+                    entry["total_points"] = int(record.get_value() or 0)
+        except Exception:
+            pass
+
+        # Count distinct days
+        days_query = (
+            f'from(bucket: "{bucket}")'
+            f" |> range(start: -{catalog_days}d)"
+            f' |> filter(fn: (r) => r._measurement == "{meas}")'
+            ' |> map(fn: (r) => ({r with _day: date.truncate(t: r._time, unit: 1d)}))'
+            " |> group()"
+            ' |> unique(column: "_day")'
+            ' |> count(column: "_day")'
+        )
+        try:
+            tables = query_api.query(days_query)
+            for table in tables:
+                for record in table.records:
+                    entry["days_with_data"] = int(record.get_value() or 0)
+        except Exception:
+            pass
+
+        # Query tag distributions for tagged measurements
+        for tag_name in cat.get("tags", []):
+            tag_query = (
+                f'import "influxdata/influxdb/schema"'
+                f'\nschema.tagValues(bucket: "{bucket}",'
+                f' tag: "{tag_name}",'
+                f" start: -{catalog_days}d,"
+                f' predicate: (r) => r._measurement == "{meas}")'
+            )
+            try:
+                tables = query_api.query(tag_query)
+                tag_counter = Counter()
+                for table in tables:
+                    for record in table.records:
+                        tag_val = record.get_value()
+                        if tag_val:
+                            tag_counter[str(tag_val)] = 1  # presence
+                # Get actual counts per tag value
+                for tag_val in tag_counter:
+                    val_count_query = (
+                        f'from(bucket: "{bucket}")'
+                        f" |> range(start: -{catalog_days}d)"
+                        f' |> filter(fn: (r) => r._measurement == "{meas}"'
+                        f' and r.{tag_name} == "{tag_val}")'
+                        " |> group()"
+                        ' |> count(column: "_value")'
+                    )
+                    try:
+                        val_tables = query_api.query(val_count_query)
+                        for vt in val_tables:
+                            for vr in vt.records:
+                                tag_counter[tag_val] = int(vr.get_value() or 0)
+                    except Exception:
+                        pass
+                if tag_counter:
+                    entry["tag_values"][tag_name] = tag_counter
+            except Exception as exc:
+                log.debug("Tag query error for %s.%s: %s", meas, tag_name, exc)
+
+        summary[meas] = entry
+
+    return summary
+
+
+def compute_field_stats(values):
+    """Compute summary statistics for a list of numeric values.
+
+    Returns a dict with mean, median, min, max, stdev, and count.
+    """
+    if not values:
+        return None
+    n = len(values)
+    result = {
+        "count": n,
+        "min": min(values),
+        "max": max(values),
+        "mean": statistics.mean(values),
+        "median": statistics.median(values),
+    }
+    if n >= 2:
+        result["stdev"] = statistics.stdev(values)
+    else:
+        result["stdev"] = 0.0
+    return result
+
+
+def _format_stat_value(val):
+    """Format a numeric value for display: ints as ints, floats to 1 decimal.
+
+    Whole numbers below 1 million are shown without decimals for readability.
+    """
+    if val == int(val) and abs(val) < 1_000_000:
+        return str(int(val))
+    return f"{val:.1f}"
+
+
+def _build_histogram(values, bins=10, width=30):
+    """Build a compact horizontal ASCII histogram and return lines.
+
+    Returns a list of strings, one per bin.
+    """
+    if not values:
+        return []
+    lo, hi = min(values), max(values)
+    if lo == hi:
+        return [f"  [{_format_stat_value(lo)}] {'█' * width} ({len(values)})"]
+    step = (hi - lo) / bins
+    counts = [0] * bins
+    for v in values:
+        idx = min(int((v - lo) / step), bins - 1)
+        counts[idx] += 1
+    max_count = max(counts) if counts else 1
+    lines = []
+    for i, c in enumerate(counts):
+        bin_lo = lo + i * step
+        bin_hi = lo + (i + 1) * step
+        bar_len = int(c / max_count * width) if max_count > 0 else 0
+        bar = "█" * bar_len
+        label = f"{_format_stat_value(bin_lo):>8}-{_format_stat_value(bin_hi):<8}"
+        lines.append(f"  {label} {bar} {c}")
+    return lines
+
+
+def print_data_summary(summary, catalog_days):
+    """Print a TUI-style summary of actual data in the database.
+
+    *summary* is the dict returned by ``query_data_summary()``.
+    """
+    catalog = get_data_catalog()
+    total_fields_with_data = 0
+    total_measurements_with_data = 0
+
+    print()
+    print("═" * 80)
+    print("  catGar Data Summary")
+    print(f"  Actual data in InfluxDB — last {catalog_days} days")
+    print("═" * 80)
+    print()
+
+    # Overview table
+    print("─" * 80)
+    print("  DATA AVAILABILITY")
+    print("─" * 80)
+    print(f"  {'Measurement':<25} {'Days w/Data':>11}  {'Points':>10}  {'Fields w/Data':>13}")
+    print(f"  {'─' * 25} {'─' * 11}  {'─' * 10}  {'─' * 13}")
+
+    for cat in catalog:
+        meas = cat["measurement"]
+        entry = summary.get(meas, {})
+        days_data = entry.get("days_with_data", 0)
+        total_pts = entry.get("total_points", 0)
+        fields_data = len(entry.get("fields", {}))
+        total_fields_with_data += fields_data
+        if days_data > 0:
+            total_measurements_with_data += 1
+        marker = "✓" if days_data > 0 else "·"
+        print(f"  {marker} {meas:<23} {days_data:>11}  {total_pts:>10,}  {fields_data:>13}")
+
+    print()
+    print(f"  Measurements with data: {total_measurements_with_data}/{len(catalog)}")
+    print(f"  Fields with data:       {total_fields_with_data}")
+    print()
+
+    # Detailed statistics per measurement
+    print("─" * 80)
+    print("  FIELD STATISTICS")
+    print("─" * 80)
+
+    for cat in catalog:
+        meas = cat["measurement"]
+        entry = summary.get(meas, {})
+        fields = entry.get("fields", {})
+        if not fields:
+            continue
+
+        print()
+        print(f"  ▸ {cat['display_name'].upper()} ({meas})")
+        print(f"    {'Field':<30} {'Count':>6} {'Min':>10} {'Mean':>10} {'Median':>10} {'Max':>10} {'StDev':>10}")
+        print(f"    {'─' * 30} {'─' * 6} {'─' * 10} {'─' * 10} {'─' * 10} {'─' * 10} {'─' * 10}")
+
+        for f in cat["fields"]:
+            fname = f["influx_field"]
+            vals = fields.get(fname)
+            if not vals:
+                continue
+            st = compute_field_stats(vals)
+            print(
+                f"    {fname:<30} {st['count']:>6}"
+                f" {_format_stat_value(st['min']):>10}"
+                f" {_format_stat_value(st['mean']):>10}"
+                f" {_format_stat_value(st['median']):>10}"
+                f" {_format_stat_value(st['max']):>10}"
+                f" {_format_stat_value(st['stdev']):>10}"
+            )
+
+        # Show tag distributions if present
+        tag_values = entry.get("tag_values", {})
+        for tag_name, counter in tag_values.items():
+            if counter:
+                print()
+                print(f"    Tag: {tag_name}")
+                for val, cnt in counter.most_common(10):
+                    print(f"      {val:<30} {cnt:>6} points")
+
+    # Distribution section — show histograms for key daily metrics
+    print()
+    print("─" * 80)
+    print("  DISTRIBUTIONS (key metrics)")
+    print("─" * 80)
+
+    # Pick interesting fields to show distributions for
+    _distribution_fields = [
+        ("daily_stats", "steps", "Daily Steps"),
+        ("daily_stats", "resting_hr", "Resting Heart Rate"),
+        ("daily_stats", "avg_stress", "Average Stress"),
+        ("sleep", "sleep_time_sec", "Sleep Time (sec)"),
+        ("training_readiness", "score", "Training Readiness"),
+        ("body_composition", "weight_grams", "Weight (g)"),
+    ]
+
+    shown_any = False
+    for meas, field, label in _distribution_fields:
+        entry = summary.get(meas, {})
+        vals = entry.get("fields", {}).get(field)
+        if not vals or len(vals) < 2:
+            continue
+        shown_any = True
+        st = compute_field_stats(vals)
+        print()
+        print(f"  {label}  (n={st['count']}, mean={_format_stat_value(st['mean'])}, median={_format_stat_value(st['median'])})")
+        bin_count = min(10, len(vals))
+        for line in _build_histogram(vals, bins=bin_count):
+            print(f"  {line}")
+
+    if not shown_any:
+        print()
+        print("  No data available for distribution charts.")
+
+    print()
+    print("═" * 80)
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Sync Garmin data to InfluxDB")
     parser.add_argument("date", nargs="?", default=None, help="Date to sync (YYYY-MM-DD). Defaults to today.")
     parser.add_argument("--days", type=int, default=None, help="Number of past days to sync")
     parser.add_argument("--backfill", action="store_true", help="Backfill all available historical data (up to 5 years)")
     parser.add_argument("--catalog", action="store_true", help="Print detailed data catalog of all tracked categories and exit")
+    parser.add_argument("--catalog-summary", action="store_true", help="Query InfluxDB and print a summary of actual data with statistics, then exit")
+    parser.add_argument("--catalog-days", type=int, default=7, help="Number of days to include in --catalog-summary (default: 7)")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help="Path to last-sync state file")
     args = parser.parse_args()
 
     if args.catalog:
         print_data_catalog()
+        return
+
+    if args.catalog_summary:
+        cfg = get_config()
+        influx = InfluxDBClient(
+            url=cfg["INFLUXDB_URL"],
+            token=cfg["INFLUXDB_TOKEN"],
+            org=cfg["INFLUXDB_ORG"],
+        )
+        try:
+            summary = query_data_summary(influx, cfg["INFLUXDB_BUCKET"], args.catalog_days)
+            print_data_summary(summary, args.catalog_days)
+        finally:
+            influx.close()
         return
 
     cfg = get_config()
