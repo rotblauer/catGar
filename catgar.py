@@ -185,9 +185,9 @@ def build_heart_rate_points(hr_data, day_str):
         if not hr_values or not isinstance(hr_values, (list, tuple)):
             continue
         for pair in hr_values:
-            if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
                 continue
-            ts_ms, hr, *_ = pair
+            ts_ms, hr = pair
             if hr is None or ts_ms is None:
                 continue
             p = (
