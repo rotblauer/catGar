@@ -117,6 +117,19 @@ _IGNORED_GENERIC_KEYS = frozenset({
     "startTimestampLocal", "endTimestampLocal",
     "userProfilePK", "startOfDayGMT", "startOfDayLocal",
     "userDailySummaryId",
+    # Wellness / daily-stats timestamp & string fields
+    "wellnessStartTimeGmt", "wellnessStartTimeLocal",
+    "wellnessEndTimeGmt", "wellnessEndTimeLocal",
+    "source", "stressQualifier",
+    # SpO2 / respiration timestamp fields
+    "latestSpo2ReadingTimeGmt", "latestSpo2ReadingTimeLocal",
+    "latestRespirationTimeGMT",
+    "latestSpO2TimestampGMT", "latestSpO2TimestampLocal",
+    # Sleep-related timestamp fields
+    "tomorrowSleepStartTimestampGMT", "tomorrowSleepEndTimestampGMT",
+    "tomorrowSleepStartTimestampLocal", "tomorrowSleepEndTimestampLocal",
+    # Body composition date fields
+    "startDate", "endDate",
 })
 
 
@@ -920,9 +933,14 @@ def find_oldest_available_date(garmin_client, earliest, latest):
 # ---------------------------------------------------------------------------
 
 def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
-    """Fetch all Garmin data for *day_str* and write to InfluxDB."""
+    """Fetch all Garmin data for *day_str* and write to InfluxDB.
+
+    Returns ``(total_points, errors, counts)`` where *counts* is a dict
+    mapping measurement name to the number of points written.
+    """
     total = 0
     errors = []
+    counts = {}
 
     def _is_no_data_not_found(exc):
         if isinstance(exc, ApiException):
@@ -957,6 +975,7 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
             if pts:
                 influx_write_api.write(bucket=bucket, org=org, record=pts)
                 total += len(pts)
+                counts[name] = counts.get(name, 0) + len(pts)
                 log.info("  %s: wrote %d points", name, len(pts))
             else:
                 log.info("  %s: no data", name)
@@ -974,6 +993,7 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
         if pts:
             influx_write_api.write(bucket=bucket, org=org, record=pts)
             total += len(pts)
+            counts["activities"] = counts.get("activities", 0) + len(pts)
             log.info("  activities: wrote %d points", len(pts))
         else:
             log.info("  activities: no data")
@@ -984,7 +1004,36 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
             log.warning("  activities: error — %s", exc)
             errors.append(("activities", exc))
 
-    return total, errors
+    return total, errors, counts
+
+
+def print_sync_summary(grand_counts, days, all_errors):
+    """Print a TUI-style summary table of the sync results."""
+    print()
+    print("┌──────────────────────────────────────────┐")
+    print("│           catGar Sync Summary            │")
+    print("├────────────────────────┬─────────────────┤")
+    print("│ Measurement            │ Points Written  │")
+    print("├────────────────────────┼─────────────────┤")
+    grand_total = 0
+    for name in (
+        "daily stats", "sleep", "heart rate", "body composition",
+        "respiration", "SpO2", "stress", "HRV", "hydration",
+        "training readiness", "training status", "max metrics",
+        "endurance score", "hill score", "fitness age", "floors",
+        "activities",
+    ):
+        count = grand_counts.get(name, 0)
+        grand_total += count
+        marker = "✓" if count > 0 else "·"
+        print(f"│ {marker} {name:<20} │ {count:>15,} │")
+    print("├────────────────────────┼─────────────────┤")
+    print(f"│ {'Total':<22} │ {grand_total:>15,} │")
+    print(f"│ {'Days synced':<22} │ {days:>15,} │")
+    if all_errors:
+        print(f"│ {'Errors':<22} │ {len(all_errors):>15,} │")
+    print("└────────────────────────┴─────────────────┘")
+    print()
 
 
 def main():
@@ -1048,20 +1097,25 @@ def main():
     days = (end - start).days + 1
     grand_total = 0
     all_errors = []
+    grand_counts = {}
 
     for i in range(days):
         day = start + timedelta(days=i)
         day_str = day.strftime("%Y-%m-%d")
         log.info("Syncing %s …", day_str)
-        total, errors = fetch_and_write(garmin, write_api, cfg["INFLUXDB_BUCKET"], cfg["INFLUXDB_ORG"], day_str)
+        total, errors, counts = fetch_and_write(garmin, write_api, cfg["INFLUXDB_BUCKET"], cfg["INFLUXDB_ORG"], day_str)
         grand_total += total
         all_errors.extend(errors)
+        for name, cnt in counts.items():
+            grand_counts[name] = grand_counts.get(name, 0) + cnt
 
     influx.close()
 
     # Record last successful sync date (only if no errors)
     if not all_errors:
         write_last_sync(end, args.state_file)
+
+    print_sync_summary(grand_counts, days, all_errors)
     log.info("Done. Wrote %d total points across %d day(s).", grand_total, days)
     if all_errors:
         log.warning("Encountered %d error(s) during sync.", len(all_errors))
