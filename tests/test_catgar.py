@@ -10,7 +10,9 @@ from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 from catgar import (
+    _build_histogram,
     _collect_extra_fields,
+    _format_stat_value,
     _safe_float,
     build_activity_points,
     build_body_composition_points,
@@ -29,11 +31,14 @@ from catgar import (
     build_stress_points,
     build_training_readiness_points,
     build_training_status_points,
+    compute_field_stats,
     ensure_bucket,
     find_oldest_available_date,
     get_data_catalog,
     print_data_catalog,
+    print_data_summary,
     print_sync_summary,
+    query_data_summary,
     read_last_sync,
     write_last_sync,
 )
@@ -888,6 +893,224 @@ class TestGetDataCatalog(unittest.TestCase):
         catalog = get_data_catalog()
         for entry in catalog:
             self.assertIn(entry["measurement"], output)
+
+
+class TestComputeFieldStats(unittest.TestCase):
+    def test_basic_stats(self):
+        vals = [10.0, 20.0, 30.0, 40.0, 50.0]
+        st = compute_field_stats(vals)
+        self.assertEqual(st["count"], 5)
+        self.assertEqual(st["min"], 10.0)
+        self.assertEqual(st["max"], 50.0)
+        self.assertAlmostEqual(st["mean"], 30.0)
+        self.assertAlmostEqual(st["median"], 30.0)
+        self.assertGreater(st["stdev"], 0)
+
+    def test_single_value(self):
+        st = compute_field_stats([42.0])
+        self.assertEqual(st["count"], 1)
+        self.assertEqual(st["min"], 42.0)
+        self.assertEqual(st["max"], 42.0)
+        self.assertAlmostEqual(st["mean"], 42.0)
+        self.assertAlmostEqual(st["median"], 42.0)
+        self.assertEqual(st["stdev"], 0.0)
+
+    def test_empty_list(self):
+        self.assertIsNone(compute_field_stats([]))
+
+    def test_two_values(self):
+        st = compute_field_stats([10.0, 20.0])
+        self.assertEqual(st["count"], 2)
+        self.assertAlmostEqual(st["mean"], 15.0)
+        self.assertAlmostEqual(st["median"], 15.0)
+        self.assertGreater(st["stdev"], 0)
+
+    def test_identical_values(self):
+        st = compute_field_stats([5.0, 5.0, 5.0])
+        self.assertEqual(st["min"], 5.0)
+        self.assertEqual(st["max"], 5.0)
+        self.assertAlmostEqual(st["stdev"], 0.0)
+
+
+class TestFormatStatValue(unittest.TestCase):
+    def test_integer_value(self):
+        self.assertEqual(_format_stat_value(10.0), "10")
+
+    def test_float_value(self):
+        self.assertEqual(_format_stat_value(10.5), "10.5")
+
+    def test_large_float(self):
+        result = _format_stat_value(1234567.89)
+        self.assertEqual(result, "1234567.9")
+
+    def test_zero(self):
+        self.assertEqual(_format_stat_value(0.0), "0")
+
+
+class TestBuildHistogram(unittest.TestCase):
+    def test_basic_histogram(self):
+        vals = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+        lines = _build_histogram(vals, bins=5, width=20)
+        self.assertEqual(len(lines), 5)
+        for line in lines:
+            self.assertIsInstance(line, str)
+
+    def test_single_value(self):
+        lines = _build_histogram([5.0], bins=5, width=20)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("5", lines[0])
+
+    def test_empty_values(self):
+        lines = _build_histogram([], bins=5, width=20)
+        self.assertEqual(lines, [])
+
+    def test_identical_values(self):
+        lines = _build_histogram([3.0, 3.0, 3.0], bins=5, width=20)
+        self.assertEqual(len(lines), 1)
+        self.assertIn("3", lines[0])
+
+    def test_histogram_contains_counts(self):
+        vals = [1.0, 1.0, 1.0, 5.0]
+        lines = _build_histogram(vals, bins=2, width=10)
+        self.assertEqual(len(lines), 2)
+        # First bin should have 3 values
+        self.assertIn("3", lines[0])
+
+
+class TestPrintDataSummary(unittest.TestCase):
+    def test_output_contains_header(self):
+        summary = {
+            "daily_stats": {
+                "days_with_data": 5,
+                "total_points": 90,
+                "fields": {
+                    "steps": [8000.0, 9000.0, 7000.0, 10000.0, 8500.0],
+                    "resting_hr": [58.0, 60.0, 57.0, 59.0, 61.0],
+                },
+                "tag_values": {},
+            },
+        }
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            print_data_summary(summary, 7)
+            output = mock_out.getvalue()
+        self.assertIn("catGar Data Summary", output)
+        self.assertIn("last 7 days", output)
+        self.assertIn("DATA AVAILABILITY", output)
+        self.assertIn("FIELD STATISTICS", output)
+
+    def test_output_shows_measurement_stats(self):
+        summary = {
+            "daily_stats": {
+                "days_with_data": 3,
+                "total_points": 54,
+                "fields": {
+                    "steps": [8000.0, 9000.0, 10000.0],
+                },
+                "tag_values": {},
+            },
+        }
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            print_data_summary(summary, 7)
+            output = mock_out.getvalue()
+        self.assertIn("daily_stats", output)
+        self.assertIn("steps", output)
+        self.assertIn("DAILY STATS", output)
+
+    def test_output_empty_summary(self):
+        summary = {}
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            print_data_summary(summary, 7)
+            output = mock_out.getvalue()
+        self.assertIn("catGar Data Summary", output)
+        self.assertIn("Measurements with data: 0/", output)
+
+    def test_output_shows_distributions(self):
+        summary = {
+            "daily_stats": {
+                "days_with_data": 5,
+                "total_points": 90,
+                "fields": {
+                    "steps": [8000.0, 9000.0, 7000.0, 10000.0, 8500.0],
+                    "resting_hr": [58.0, 60.0, 57.0, 59.0, 61.0],
+                    "avg_stress": [25.0, 30.0, 28.0, 35.0, 22.0],
+                },
+                "tag_values": {},
+            },
+        }
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            print_data_summary(summary, 7)
+            output = mock_out.getvalue()
+        self.assertIn("DISTRIBUTIONS", output)
+        self.assertIn("Daily Steps", output)
+
+    def test_output_shows_tag_values(self):
+        from collections import Counter
+        summary = {
+            "activity": {
+                "days_with_data": 3,
+                "total_points": 6,
+                "fields": {
+                    "distance_meters": [5000.0, 3000.0, 8000.0],
+                },
+                "tag_values": {
+                    "type": Counter({"running": 4, "cycling": 2}),
+                },
+            },
+        }
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            print_data_summary(summary, 14)
+            output = mock_out.getvalue()
+        self.assertIn("running", output)
+        self.assertIn("cycling", output)
+        self.assertIn("last 14 days", output)
+
+
+class TestQueryDataSummary(unittest.TestCase):
+    def test_queries_all_measurements(self):
+        """Verify query_data_summary queries for every measurement in catalog."""
+        catalog = get_data_catalog()
+        mock_client = MagicMock()
+        mock_query_api = MagicMock()
+        mock_client.query_api.return_value = mock_query_api
+        mock_query_api.query.return_value = []
+
+        result = query_data_summary(mock_client, "garmin", 7)
+
+        # Should have an entry for every measurement
+        for cat in catalog:
+            self.assertIn(cat["measurement"], result)
+
+    def test_handles_query_errors_gracefully(self):
+        """Verify query_data_summary continues on query errors."""
+        mock_client = MagicMock()
+        mock_query_api = MagicMock()
+        mock_client.query_api.return_value = mock_query_api
+        mock_query_api.query.side_effect = Exception("connection refused")
+
+        result = query_data_summary(mock_client, "garmin", 7)
+
+        # Should still return entries (empty) for each measurement
+        catalog = get_data_catalog()
+        self.assertEqual(len(result), len(catalog))
+        for meas, entry in result.items():
+            self.assertEqual(entry["days_with_data"], 0)
+            self.assertEqual(entry["total_points"], 0)
+            self.assertEqual(entry["fields"], {})
+
+    def test_empty_result_structure(self):
+        """Verify each entry has expected keys."""
+        mock_client = MagicMock()
+        mock_query_api = MagicMock()
+        mock_client.query_api.return_value = mock_query_api
+        mock_query_api.query.return_value = []
+
+        result = query_data_summary(mock_client, "garmin", 30)
+
+        for meas, entry in result.items():
+            self.assertIn("days_with_data", entry)
+            self.assertIn("total_points", entry)
+            self.assertIn("fields", entry)
+            self.assertIn("tag_values", entry)
 
 
 if __name__ == "__main__":
