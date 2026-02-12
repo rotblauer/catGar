@@ -187,7 +187,7 @@ def build_heart_rate_points(hr_data, day_str):
         for pair in hr_values:
             if not isinstance(pair, (list, tuple)) or len(pair) < 2:
                 continue
-            ts_ms, hr = pair[:2]
+            ts_ms, hr = pair[0], pair[1]
             if hr is None or ts_ms is None:
                 continue
             p = (
@@ -371,8 +371,10 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
     def _is_no_data_not_found(exc):
         if isinstance(exc, ApiException):
             return False
-        resp = getattr(exc, "response", None)
-        return getattr(resp, "status_code", None) == 404
+        if isinstance(exc, HTTPError):
+            resp = getattr(exc, "response", None)
+            return getattr(resp, "status_code", None) == 404
+        return False
 
     collectors = [
         ("daily stats", lambda: build_daily_stats_points(garmin_client.get_stats(day_str), day_str)),
