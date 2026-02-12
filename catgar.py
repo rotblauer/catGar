@@ -1011,7 +1011,7 @@ def print_sync_summary(grand_counts, days, all_errors):
     """Print a TUI-style summary table of the sync results."""
     print()
     print("┌──────────────────────────────────────────┐")
-    print("│          catGar Sync Summary              │")
+    print("│           catGar Sync Summary            │")
     print("├────────────────────────┬─────────────────┤")
     print("│ Measurement            │ Points Written  │")
     print("├────────────────────────┼─────────────────┤")
