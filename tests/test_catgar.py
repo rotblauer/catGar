@@ -131,6 +131,15 @@ class TestBuildHeartRatePoints(unittest.TestCase):
         pts = build_heart_rate_points(None, "2024-06-01")
         self.assertEqual(pts, [])
 
+    def test_invalid_entries_skipped(self):
+        data = [
+            "oops",
+            {"heartRateValues": "bad"},
+            {"heartRateValues": [[1717200000000, 65], "bad", [None, 70]]},
+        ]
+        pts = build_heart_rate_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 1)
+
 
 class TestBuildActivityPoints(unittest.TestCase):
     def test_basic_activity(self):

@@ -60,6 +60,24 @@ def get_config():
     return cfg
 
 
+def ensure_bucket(influx_client, bucket, org):
+    """Ensure the target InfluxDB bucket exists, creating it if missing."""
+    buckets_api = influx_client.buckets_api()
+    existing = buckets_api.find_bucket_by_name(bucket)
+    if existing:
+        return
+    try:
+        buckets_api.create_bucket(bucket_name=bucket, org=org)
+        log.info("Created missing InfluxDB bucket '%s'.", bucket)
+    except Exception as exc:
+        log.error("Failed to create bucket '%s': %s", bucket, exc)
+        influx_client.close()
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Garmin data → InfluxDB points
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Garmin data → InfluxDB points
 # ---------------------------------------------------------------------------
@@ -162,10 +180,15 @@ def build_heart_rate_points(hr_data, day_str):
     points = []
 
     for entry in (hr_data or []):
-        hr_values = entry.get("heartRateValues")
-        if not hr_values:
+        if not isinstance(entry, dict):
             continue
-        for ts_ms, hr in hr_values:
+        hr_values = entry.get("heartRateValues")
+        if not hr_values or not isinstance(hr_values, (list, tuple)):
+            continue
+        for pair in hr_values:
+            if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                continue
+            ts_ms, hr = pair[0], pair[1]
             if hr is None or ts_ms is None:
                 continue
             p = (
@@ -346,6 +369,15 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
     total = 0
     errors = []
 
+    def _is_no_data_not_found(exc):
+        resp = getattr(exc, "response", None)
+        if getattr(resp, "status_code", None) == 404:
+            return True
+        msg = str(exc).lower()
+        if "bucket" in msg:
+            return False
+        return "404" in msg and "not found" in msg
+
     collectors = [
         ("daily stats", lambda: build_daily_stats_points(garmin_client.get_stats(day_str), day_str)),
         ("sleep", lambda: build_sleep_points(garmin_client.get_sleep_data(day_str), day_str)),
@@ -365,8 +397,11 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
             else:
                 log.info("  %s: no data", name)
         except Exception as exc:
-            log.warning("  %s: error — %s", name, exc)
-            errors.append((name, exc))
+            if _is_no_data_not_found(exc):
+                log.info("  %s: no data (not found)", name)
+            else:
+                log.warning("  %s: error — %s", name, exc)
+                errors.append((name, exc))
 
     # Activities are not date-range specific; get recent ones.
     try:
@@ -379,8 +414,11 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
         else:
             log.info("  activities: no data")
     except Exception as exc:
-        log.warning("  activities: error — %s", exc)
-        errors.append(("activities", exc))
+        if _is_no_data_not_found(exc):
+            log.info("  activities: no data (not found)")
+        else:
+            log.warning("  activities: error — %s", exc)
+            errors.append(("activities", exc))
 
     return total, errors
 
@@ -408,6 +446,7 @@ def main():
         org=cfg["INFLUXDB_ORG"],
     )
     write_api = influx.write_api(write_options=SYNCHRONOUS)
+    ensure_bucket(influx, cfg["INFLUXDB_BUCKET"], cfg["INFLUXDB_ORG"])
 
     # --- Determine dates ---
     today = date.today()
