@@ -403,8 +403,8 @@ class TestEnsureBucket(unittest.TestCase):
         ensure_bucket(mock_client, "test_bucket", "test_org")
 
         mock_buckets_api.create_bucket.assert_called_once()
-        call_kwargs = mock_buckets_api.create_bucket.call_args
-        rules = call_kwargs.kwargs.get("retention_rules", [])
+        _, kwargs = mock_buckets_api.create_bucket.call_args
+        rules = kwargs.get("retention_rules", [])
         self.assertEqual(len(rules), 1)
         self.assertEqual(rules[0].every_seconds, 0)
 

@@ -439,6 +439,8 @@ def find_oldest_available_date(garmin_client, earliest, latest):
     high = (latest - earliest).days
 
     if high <= 0:
+        if _probe_date(garmin_client, latest.strftime("%Y-%m-%d")):
+            return latest
         return latest
 
     # Quick check: if the earliest date already has data, return it
