@@ -1036,13 +1036,410 @@ def print_sync_summary(grand_counts, days, all_errors):
     print()
 
 
+def get_data_catalog():
+    """Return a structured catalog of all data categories persisted by catGar.
+
+    Each entry is a dict with:
+        - measurement: InfluxDB measurement name
+        - display_name: human-readable label used in sync summaries
+        - description: what the data represents
+        - garmin_api: Garmin Connect API method used to fetch the data
+        - frequency: how often data is recorded (daily, per-reading, per-activity)
+        - fields: list of dicts with 'garmin_key', 'influx_field', and 'description'
+        - tags: list of tag names applied to the measurement (if any)
+        - notes: additional context for dashboard or analysis use
+    """
+    return [
+        {
+            "measurement": "daily_stats",
+            "display_name": "daily stats",
+            "description": "Daily summary of steps, calories, heart rate, stress, body battery, and activity intensity.",
+            "garmin_api": "get_stats(date)",
+            "frequency": "daily",
+            "fields": [
+                {"garmin_key": "totalSteps", "influx_field": "steps", "description": "Total steps for the day"},
+                {"garmin_key": "totalDistanceMeters", "influx_field": "distance_meters", "description": "Total distance walked/run in meters"},
+                {"garmin_key": "activeKilocalories", "influx_field": "active_kcal", "description": "Calories burned through activity"},
+                {"garmin_key": "totalKilocalories", "influx_field": "total_kcal", "description": "Total calories burned (active + resting)"},
+                {"garmin_key": "restingHeartRate", "influx_field": "resting_hr", "description": "Resting heart rate (bpm)"},
+                {"garmin_key": "maxHeartRate", "influx_field": "max_hr", "description": "Maximum heart rate recorded (bpm)"},
+                {"garmin_key": "minHeartRate", "influx_field": "min_hr", "description": "Minimum heart rate recorded (bpm)"},
+                {"garmin_key": "averageHeartRate", "influx_field": "avg_hr", "description": "Average heart rate (bpm)"},
+                {"garmin_key": "moderateIntensityMinutes", "influx_field": "moderate_intensity_min", "description": "Minutes of moderate-intensity activity"},
+                {"garmin_key": "vigorousIntensityMinutes", "influx_field": "vigorous_intensity_min", "description": "Minutes of vigorous-intensity activity"},
+                {"garmin_key": "floorsAscended", "influx_field": "floors_ascended", "description": "Floors climbed up"},
+                {"garmin_key": "floorsDescended", "influx_field": "floors_descended", "description": "Floors descended"},
+                {"garmin_key": "averageStressLevel", "influx_field": "avg_stress", "description": "Average stress level (0-100)"},
+                {"garmin_key": "maxStressLevel", "influx_field": "max_stress", "description": "Maximum stress level (0-100)"},
+                {"garmin_key": "bodyBatteryChargedValue", "influx_field": "body_battery_charged", "description": "Body battery energy gained"},
+                {"garmin_key": "bodyBatteryDrainedValue", "influx_field": "body_battery_drained", "description": "Body battery energy used"},
+                {"garmin_key": "bodyBatteryHighestValue", "influx_field": "body_battery_high", "description": "Highest body battery level"},
+                {"garmin_key": "bodyBatteryLowestValue", "influx_field": "body_battery_low", "description": "Lowest body battery level"},
+            ],
+            "tags": [],
+            "notes": "Core daily wellness snapshot. Great for trend analysis over weeks/months.",
+        },
+        {
+            "measurement": "sleep",
+            "display_name": "sleep",
+            "description": "Nightly sleep duration, stages, respiration, SpO2, heart rate, and sleep quality scores.",
+            "garmin_api": "get_sleep_data(date)",
+            "frequency": "daily",
+            "fields": [
+                {"garmin_key": "sleepTimeSeconds", "influx_field": "sleep_time_sec", "description": "Total sleep time in seconds"},
+                {"garmin_key": "deepSleepSeconds", "influx_field": "deep_sleep_sec", "description": "Deep sleep duration in seconds"},
+                {"garmin_key": "lightSleepSeconds", "influx_field": "light_sleep_sec", "description": "Light sleep duration in seconds"},
+                {"garmin_key": "remSleepSeconds", "influx_field": "rem_sleep_sec", "description": "REM sleep duration in seconds"},
+                {"garmin_key": "awakeSleepSeconds", "influx_field": "awake_sec", "description": "Time awake during sleep in seconds"},
+                {"garmin_key": "averageSpO2Value", "influx_field": "avg_spo2", "description": "Average blood oxygen during sleep (%)"},
+                {"garmin_key": "lowestSpO2Value", "influx_field": "lowest_spo2", "description": "Lowest blood oxygen during sleep (%)"},
+                {"garmin_key": "averageRespirationValue", "influx_field": "avg_respiration", "description": "Average respiration rate during sleep (breaths/min)"},
+                {"garmin_key": "lowestRespirationValue", "influx_field": "lowest_respiration", "description": "Lowest respiration rate during sleep"},
+                {"garmin_key": "highestRespirationValue", "influx_field": "highest_respiration", "description": "Highest respiration rate during sleep"},
+                {"garmin_key": "averageSpO2HRSleep", "influx_field": "avg_hr_sleep", "description": "Average heart rate during sleep (bpm)"},
+                {"garmin_key": "sleepScores.overall", "influx_field": "score_overall", "description": "Overall sleep quality score"},
+                {"garmin_key": "sleepScores.totalDuration", "influx_field": "score_totalDuration", "description": "Sleep duration score"},
+                {"garmin_key": "sleepScores.stress", "influx_field": "score_stress", "description": "Sleep stress score"},
+                {"garmin_key": "sleepScores.revitalizationScore", "influx_field": "score_revitalizationScore", "description": "Sleep revitalization score"},
+            ],
+            "tags": [],
+            "notes": "Sleep data is nested under dailySleepDTO. Sleep scores may be raw numbers or {value: N} dicts.",
+        },
+        {
+            "measurement": "heart_rate",
+            "display_name": "heart rate",
+            "description": "Continuous heart rate readings throughout the day, typically every 15-60 seconds.",
+            "garmin_api": "get_heart_rates(date)",
+            "frequency": "per-reading (sub-minute intervals)",
+            "fields": [
+                {"garmin_key": "heartRateValues[timestamp_ms, bpm]", "influx_field": "bpm", "description": "Heart rate in beats per minute"},
+            ],
+            "tags": [],
+            "notes": "High-frequency time series. Timestamps are in milliseconds. Expect 500-2000+ points per day.",
+        },
+        {
+            "measurement": "activity",
+            "display_name": "activities",
+            "description": "Individual workout/activity sessions (runs, rides, walks, etc.) with performance metrics.",
+            "garmin_api": "get_activities_by_date(date, date)",
+            "frequency": "per-activity",
+            "fields": [
+                {"garmin_key": "distance", "influx_field": "distance_meters", "description": "Total distance in meters"},
+                {"garmin_key": "duration", "influx_field": "duration_sec", "description": "Activity duration in seconds"},
+                {"garmin_key": "elapsedDuration", "influx_field": "elapsed_sec", "description": "Total elapsed time in seconds"},
+                {"garmin_key": "movingDuration", "influx_field": "moving_sec", "description": "Moving time in seconds"},
+                {"garmin_key": "averageHR", "influx_field": "avg_hr", "description": "Average heart rate (bpm)"},
+                {"garmin_key": "maxHR", "influx_field": "max_hr", "description": "Maximum heart rate (bpm)"},
+                {"garmin_key": "calories", "influx_field": "calories", "description": "Calories burned during activity"},
+                {"garmin_key": "averageSpeed", "influx_field": "avg_speed", "description": "Average speed (m/s)"},
+                {"garmin_key": "maxSpeed", "influx_field": "max_speed", "description": "Maximum speed (m/s)"},
+                {"garmin_key": "elevationGain", "influx_field": "elevation_gain", "description": "Total elevation gained (meters)"},
+                {"garmin_key": "elevationLoss", "influx_field": "elevation_loss", "description": "Total elevation lost (meters)"},
+                {"garmin_key": "averageRunningCadenceInStepsPerMinute", "influx_field": "avg_cadence", "description": "Average running cadence (steps/min)"},
+                {"garmin_key": "steps", "influx_field": "steps", "description": "Steps during activity"},
+                {"garmin_key": "vO2MaxValue", "influx_field": "vo2max", "description": "VO2 max estimate from activity"},
+                {"garmin_key": "avgPower", "influx_field": "avg_power", "description": "Average power output (watts)"},
+                {"garmin_key": "maxPower", "influx_field": "max_power", "description": "Maximum power output (watts)"},
+            ],
+            "tags": ["type", "name"],
+            "notes": "Tagged by activity type (running, cycling, etc.) and activity name. Zero or more per day.",
+        },
+        {
+            "measurement": "body_composition",
+            "display_name": "body composition",
+            "description": "Body weight, BMI, body fat percentage, muscle mass, and related metrics from a smart scale.",
+            "garmin_api": "get_body_composition(date)",
+            "frequency": "daily (when measured)",
+            "fields": [
+                {"garmin_key": "weight", "influx_field": "weight_grams", "description": "Body weight in grams"},
+                {"garmin_key": "bmi", "influx_field": "bmi", "description": "Body Mass Index"},
+                {"garmin_key": "bodyFat", "influx_field": "body_fat_pct", "description": "Body fat percentage"},
+                {"garmin_key": "bodyWater", "influx_field": "body_water_pct", "description": "Body water percentage"},
+                {"garmin_key": "muscleMass", "influx_field": "muscle_mass_grams", "description": "Muscle mass in grams"},
+                {"garmin_key": "skeletalMuscleMass", "influx_field": "skeletal_muscle_mass_grams", "description": "Skeletal muscle mass in grams"},
+                {"garmin_key": "boneMass", "influx_field": "bone_mass_grams", "description": "Bone mass in grams"},
+                {"garmin_key": "metabolicAge", "influx_field": "metabolic_age", "description": "Estimated metabolic age (years)"},
+                {"garmin_key": "visceralFat", "influx_field": "visceral_fat", "description": "Visceral fat rating"},
+                {"garmin_key": "weightChange", "influx_field": "weight_change", "description": "Weight change from previous measurement"},
+                {"garmin_key": "physiqueRating", "influx_field": "physique_rating", "description": "Body physique rating"},
+            ],
+            "tags": [],
+            "notes": "Requires a Garmin-compatible smart scale. Weight is in grams (divide by 1000 for kg).",
+        },
+        {
+            "measurement": "respiration",
+            "display_name": "respiration",
+            "description": "Daily respiration rate summary (waking and sleeping averages).",
+            "garmin_api": "get_respiration_data(date)",
+            "frequency": "daily",
+            "fields": [
+                {"garmin_key": "avgWakingRespirationValue", "influx_field": "avg_waking_respiration", "description": "Average waking respiration rate (breaths/min)"},
+                {"garmin_key": "highestRespirationValue", "influx_field": "highest_respiration", "description": "Highest respiration rate (breaths/min)"},
+                {"garmin_key": "lowestRespirationValue", "influx_field": "lowest_respiration", "description": "Lowest respiration rate (breaths/min)"},
+                {"garmin_key": "avgSleepRespirationValue", "influx_field": "avg_sleep_respiration", "description": "Average sleep respiration rate (breaths/min)"},
+            ],
+            "tags": [],
+            "notes": "Normal adult range is 12-20 breaths/min. Useful for respiratory health tracking.",
+        },
+        {
+            "measurement": "spo2",
+            "display_name": "SpO2",
+            "description": "Blood oxygen saturation (SpO2) readings — average, lowest, and latest.",
+            "garmin_api": "get_spo2_data(date)",
+            "frequency": "daily",
+            "fields": [
+                {"garmin_key": "averageSpO2", "influx_field": "averageSpO2", "description": "Average blood oxygen saturation (%)"},
+                {"garmin_key": "lowestSpO2", "influx_field": "lowestSpO2", "description": "Lowest blood oxygen saturation (%)"},
+                {"garmin_key": "latestSpO2", "influx_field": "latestSpO2", "description": "Most recent SpO2 reading (%)"},
+            ],
+            "tags": [],
+            "notes": "Normal SpO2 is 95-100%. Drops below 90% may indicate health concerns.",
+        },
+        {
+            "measurement": "stress",
+            "display_name": "stress",
+            "description": "Daily stress levels and duration breakdown by intensity.",
+            "garmin_api": "get_stress_data(date)",
+            "frequency": "daily",
+            "fields": [
+                {"garmin_key": "avgStressLevel", "influx_field": "avg_stress", "description": "Average stress level (0-100)"},
+                {"garmin_key": "maxStressLevel", "influx_field": "max_stress", "description": "Maximum stress level (0-100)"},
+                {"garmin_key": "totalStressDuration", "influx_field": "total_stress_duration", "description": "Total time under stress (seconds)"},
+                {"garmin_key": "lowStressDuration", "influx_field": "low_stress_duration", "description": "Time at low stress (seconds)"},
+                {"garmin_key": "mediumStressDuration", "influx_field": "medium_stress_duration", "description": "Time at medium stress (seconds)"},
+                {"garmin_key": "highStressDuration", "influx_field": "high_stress_duration", "description": "Time at high stress (seconds)"},
+                {"garmin_key": "totalRestStressDuration", "influx_field": "rest_stress_duration", "description": "Time at rest / no stress (seconds)"},
+            ],
+            "tags": [],
+            "notes": "Stress is derived from heart rate variability (HRV). 0-25=rest, 26-50=low, 51-75=medium, 76-100=high.",
+        },
+        {
+            "measurement": "hrv",
+            "display_name": "HRV",
+            "description": "Heart Rate Variability — weekly average, nightly values, and personal baseline range.",
+            "garmin_api": "get_hrv_data(date)",
+            "frequency": "daily",
+            "fields": [
+                {"garmin_key": "weeklyAvg", "influx_field": "weekly_avg", "description": "7-day rolling HRV average (ms)"},
+                {"garmin_key": "lastNight", "influx_field": "last_night", "description": "HRV during last night's sleep (ms)"},
+                {"garmin_key": "lastNightAvg", "influx_field": "last_night_avg", "description": "Average nightly HRV (ms)"},
+                {"garmin_key": "lastNight5MinHigh", "influx_field": "last_night_5min_high", "description": "Highest 5-minute HRV window during sleep (ms)"},
+                {"garmin_key": "baseline.lowUpper", "influx_field": "baseline_lowUpper", "description": "Upper bound of low HRV baseline (ms)"},
+                {"garmin_key": "baseline.balancedLow", "influx_field": "baseline_balancedLow", "description": "Lower bound of balanced HRV range (ms)"},
+                {"garmin_key": "baseline.balancedUpper", "influx_field": "baseline_balancedUpper", "description": "Upper bound of balanced HRV range (ms)"},
+            ],
+            "tags": [],
+            "notes": "HRV data may be under 'hrvSummary' key or flat. Higher HRV generally indicates better recovery.",
+        },
+        {
+            "measurement": "hydration",
+            "display_name": "hydration",
+            "description": "Daily fluid intake tracking and hydration goals.",
+            "garmin_api": "get_hydration_data(date)",
+            "frequency": "daily",
+            "fields": [
+                {"garmin_key": "valueInML", "influx_field": "intake_ml", "description": "Fluid intake in milliliters"},
+                {"garmin_key": "goalInML", "influx_field": "goal_ml", "description": "Daily hydration goal in milliliters"},
+                {"garmin_key": "sweatLossInML", "influx_field": "sweat_loss_ml", "description": "Estimated sweat loss in milliliters"},
+            ],
+            "tags": [],
+            "notes": "Hydration tracking is manual entry. Sweat loss is estimated from activities.",
+        },
+        {
+            "measurement": "training_readiness",
+            "display_name": "training readiness",
+            "description": "Garmin's training readiness score based on sleep, recovery, and training load.",
+            "garmin_api": "get_training_readiness(date)",
+            "frequency": "daily",
+            "fields": [
+                {"garmin_key": "score", "influx_field": "score", "description": "Overall training readiness score (0-100)"},
+                {"garmin_key": "sleepScore", "influx_field": "sleep_score", "description": "Sleep contribution to readiness"},
+                {"garmin_key": "recoveryTime", "influx_field": "recovery_time", "description": "Recommended recovery time (hours)"},
+                {"garmin_key": "acuteLoad", "influx_field": "acute_load", "description": "Recent training load (acute)"},
+                {"garmin_key": "hrvStatus", "influx_field": "hrv_status", "description": "HRV status score"},
+                {"garmin_key": "trainingLoad", "influx_field": "training_load", "description": "Current training load value"},
+            ],
+            "tags": [],
+            "notes": "Higher scores = more ready to train. Below 33 suggests rest is needed.",
+        },
+        {
+            "measurement": "training_status",
+            "display_name": "training status",
+            "description": "Training load balance, VO2 max, and lactate threshold metrics.",
+            "garmin_api": "get_training_status(date)",
+            "frequency": "daily",
+            "fields": [
+                {"garmin_key": "trainingLoadBalance", "influx_field": "load_balance", "description": "Training load balance ratio"},
+                {"garmin_key": "ltTimestamp", "influx_field": "lt_timestamp", "description": "Lactate threshold test timestamp"},
+                {"garmin_key": "vo2MaxValue", "influx_field": "vo2max", "description": "VO2 max estimate (ml/kg/min)"},
+                {"garmin_key": "loadFocus", "influx_field": "load_focus", "description": "Training load focus area"},
+                {"garmin_key": "lactateThresholdHeartRate", "influx_field": "lt_heart_rate", "description": "Heart rate at lactate threshold (bpm)"},
+                {"garmin_key": "lactateThresholdSpeed", "influx_field": "lt_speed", "description": "Speed at lactate threshold (m/s)"},
+            ],
+            "tags": [],
+            "notes": "Advanced training metrics. VO2 max is a key indicator of cardiovascular fitness.",
+        },
+        {
+            "measurement": "max_metrics",
+            "display_name": "max metrics",
+            "description": "VO2 max and fitness age estimates, broken down by sport type.",
+            "garmin_api": "get_max_metrics(date)",
+            "frequency": "daily",
+            "fields": [
+                {"garmin_key": "vo2MaxPreciseValue", "influx_field": "vo2max_precise", "description": "Precise VO2 max value (ml/kg/min)"},
+                {"garmin_key": "vo2MaxValue", "influx_field": "vo2max", "description": "Rounded VO2 max value"},
+                {"garmin_key": "fitnessAge", "influx_field": "fitness_age", "description": "Estimated fitness age (years)"},
+            ],
+            "tags": ["sport"],
+            "notes": "Tagged by sport (running, cycling, etc.). May contain multiple entries per day.",
+        },
+        {
+            "measurement": "endurance_score",
+            "display_name": "endurance score",
+            "description": "Garmin's endurance score reflecting aerobic endurance fitness.",
+            "garmin_api": "get_endurance_score(date)",
+            "frequency": "daily",
+            "fields": [
+                {"garmin_key": "overallScore", "influx_field": "overall_score", "description": "Overall endurance score"},
+                {"garmin_key": "enduranceScore", "influx_field": "endurance_score", "description": "Specific endurance component score"},
+            ],
+            "tags": [],
+            "notes": "Builds over time with consistent aerobic training. Higher is better.",
+        },
+        {
+            "measurement": "hill_score",
+            "display_name": "hill score",
+            "description": "Garmin's hill score reflecting climbing/uphill fitness.",
+            "garmin_api": "get_hill_score(date)",
+            "frequency": "daily",
+            "fields": [
+                {"garmin_key": "overallScore", "influx_field": "overall_score", "description": "Overall hill fitness score"},
+                {"garmin_key": "hillScore", "influx_field": "hill_score", "description": "Specific hill component score"},
+            ],
+            "tags": [],
+            "notes": "Improves with elevation-heavy workouts. Useful for trail runners and hikers.",
+        },
+        {
+            "measurement": "fitness_age",
+            "display_name": "fitness age",
+            "description": "Estimated fitness age compared to chronological age, with contributing metrics.",
+            "garmin_api": "get_fitnessage_data(date)",
+            "frequency": "daily",
+            "fields": [
+                {"garmin_key": "fitnessAge", "influx_field": "fitness_age", "description": "Estimated fitness age (years)"},
+                {"garmin_key": "chronologicalAge", "influx_field": "chronological_age", "description": "Actual age (years)"},
+                {"garmin_key": "bmi", "influx_field": "bmi", "description": "Body Mass Index"},
+                {"garmin_key": "healthyBmiTop", "influx_field": "healthy_bmi_top", "description": "Upper bound of healthy BMI range"},
+                {"garmin_key": "healthyBmiBottom", "influx_field": "healthy_bmi_bottom", "description": "Lower bound of healthy BMI range"},
+                {"garmin_key": "vigorousMinutes", "influx_field": "vigorous_minutes", "description": "Weekly vigorous activity minutes"},
+                {"garmin_key": "vigorousMinutesGoal", "influx_field": "vigorous_minutes_goal", "description": "Weekly vigorous minutes goal"},
+                {"garmin_key": "restingHr", "influx_field": "resting_hr", "description": "Resting heart rate (bpm)"},
+                {"garmin_key": "restingHrGoal", "influx_field": "resting_hr_goal", "description": "Resting heart rate goal (bpm)"},
+            ],
+            "tags": [],
+            "notes": "A fitness age lower than chronological age indicates above-average fitness for your age.",
+        },
+        {
+            "measurement": "floors",
+            "display_name": "floors",
+            "description": "Daily floors (flights of stairs) climbed and descended.",
+            "garmin_api": "get_floors(date)",
+            "frequency": "daily",
+            "fields": [
+                {"garmin_key": "floorsAscended", "influx_field": "floors_ascended", "description": "Floors climbed up"},
+                {"garmin_key": "floorsDescended", "influx_field": "floors_descended", "description": "Floors descended"},
+                {"garmin_key": "floorsAscendedGoal", "influx_field": "floors_ascended_goal", "description": "Daily floors goal"},
+            ],
+            "tags": [],
+            "notes": "One floor ≈ 3 meters (10 feet) of elevation gain.",
+        },
+    ]
+
+
+def print_data_catalog():
+    """Print a detailed, AI-prompt-friendly catalog of all catGar data categories.
+
+    Designed for use as context in AI prompts, dashboard planning, and data exploration.
+    Output is structured plain text that is easy to parse and reference.
+    """
+    catalog = get_data_catalog()
+
+    print()
+    print("=" * 80)
+    print("  catGar Data Catalog")
+    print("  Complete reference of all Garmin health & fitness data persisted to InfluxDB")
+    print("=" * 80)
+    print()
+    print(f"Total data categories: {len(catalog)}")
+    print(f"Total tracked fields:  {sum(len(c['fields']) for c in catalog)}")
+    print()
+
+    # Quick-reference table
+    print("─" * 80)
+    print("  QUICK REFERENCE")
+    print("─" * 80)
+    print(f"  {'Measurement':<25} {'Frequency':<30} {'Fields':>6}  {'Tags'}")
+    print(f"  {'─' * 25} {'─' * 30} {'─' * 6}  {'─' * 15}")
+    for cat in catalog:
+        tags = ", ".join(cat["tags"]) if cat["tags"] else "—"
+        print(f"  {cat['measurement']:<25} {cat['frequency']:<30} {len(cat['fields']):>6}  {tags}")
+    print()
+
+    # Detailed breakdown
+    print("─" * 80)
+    print("  DETAILED FIELD REFERENCE")
+    print("─" * 80)
+
+    for i, cat in enumerate(catalog, 1):
+        print()
+        print(f"  [{i}/{len(catalog)}] {cat['display_name'].upper()}")
+        print(f"  Measurement:  {cat['measurement']}")
+        print(f"  Description:  {cat['description']}")
+        print(f"  Garmin API:   {cat['garmin_api']}")
+        print(f"  Frequency:    {cat['frequency']}")
+        if cat["tags"]:
+            print(f"  Tags:         {', '.join(cat['tags'])}")
+        print(f"  Notes:        {cat['notes']}")
+        print()
+        print(f"    {'Garmin Key':<45} {'InfluxDB Field':<30} Description")
+        print(f"    {'─' * 45} {'─' * 30} {'─' * 40}")
+        for f in cat["fields"]:
+            print(f"    {f['garmin_key']:<45} {f['influx_field']:<30} {f['description']}")
+        print()
+
+    # Footer with usage hints
+    print("─" * 80)
+    print("  USAGE NOTES")
+    print("─" * 80)
+    print()
+    print("  • All daily measurements use second-precision timestamps at midnight (00:00:00).")
+    print("  • Heart rate uses millisecond-precision timestamps from the watch.")
+    print("  • Activities are timestamped at their start time with second precision.")
+    print("  • Additional numeric fields from Garmin are auto-discovered and stored.")
+    print("  • All numeric values are stored as floats in InfluxDB.")
+    print("  • Data is stored in the InfluxDB bucket configured via INFLUXDB_BUCKET (default: 'garmin').")
+    print()
+    print("  Example InfluxDB queries:")
+    print("    from(bucket: \"garmin\") |> range(start: -7d) |> filter(fn: (r) => r._measurement == \"daily_stats\")")
+    print("    from(bucket: \"garmin\") |> range(start: -30d) |> filter(fn: (r) => r._measurement == \"sleep\" and r._field == \"sleep_time_sec\")")
+    print("    from(bucket: \"garmin\") |> range(start: -30d) |> filter(fn: (r) => r._measurement == \"activity\" and r.type == \"running\")")
+    print()
+    print("=" * 80)
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Sync Garmin data to InfluxDB")
     parser.add_argument("date", nargs="?", default=None, help="Date to sync (YYYY-MM-DD). Defaults to today.")
     parser.add_argument("--days", type=int, default=None, help="Number of past days to sync")
     parser.add_argument("--backfill", action="store_true", help="Backfill all available historical data (up to 5 years)")
+    parser.add_argument("--catalog", action="store_true", help="Print detailed data catalog of all tracked categories and exit")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help="Path to last-sync state file")
     args = parser.parse_args()
+
+    if args.catalog:
+        print_data_catalog()
+        return
 
     cfg = get_config()
 

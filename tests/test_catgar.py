@@ -31,6 +31,8 @@ from catgar import (
     build_training_status_points,
     ensure_bucket,
     find_oldest_available_date,
+    get_data_catalog,
+    print_data_catalog,
     print_sync_summary,
     read_last_sync,
     write_last_sync,
@@ -821,6 +823,71 @@ class TestPrintSyncSummary(unittest.TestCase):
             output = mock_out.getvalue()
         self.assertIn("catGar Sync Summary", output)
         self.assertIn("Total", output)
+
+
+class TestGetDataCatalog(unittest.TestCase):
+    """Test the data catalog functions."""
+
+    def test_catalog_returns_all_categories(self):
+        catalog = get_data_catalog()
+        self.assertEqual(len(catalog), 17)
+
+    def test_catalog_entry_structure(self):
+        catalog = get_data_catalog()
+        required_keys = {"measurement", "display_name", "description", "garmin_api",
+                         "frequency", "fields", "tags", "notes"}
+        for entry in catalog:
+            self.assertEqual(set(entry.keys()), required_keys)
+
+    def test_catalog_field_structure(self):
+        catalog = get_data_catalog()
+        field_keys = {"garmin_key", "influx_field", "description"}
+        for entry in catalog:
+            self.assertGreater(len(entry["fields"]), 0, f"{entry['measurement']} has no fields")
+            for f in entry["fields"]:
+                self.assertEqual(set(f.keys()), field_keys)
+
+    def test_catalog_measurement_names_unique(self):
+        catalog = get_data_catalog()
+        measurements = [c["measurement"] for c in catalog]
+        self.assertEqual(len(measurements), len(set(measurements)))
+
+    def test_catalog_display_names_match_sync_summary(self):
+        """Display names should match the names used in print_sync_summary."""
+        catalog = get_data_catalog()
+        display_names = {c["display_name"] for c in catalog}
+        expected = {
+            "daily stats", "sleep", "heart rate", "body composition",
+            "respiration", "SpO2", "stress", "HRV", "hydration",
+            "training readiness", "training status", "max metrics",
+            "endurance score", "hill score", "fitness age", "floors",
+            "activities",
+        }
+        self.assertEqual(display_names, expected)
+
+    def test_catalog_tags_are_lists(self):
+        catalog = get_data_catalog()
+        for entry in catalog:
+            self.assertIsInstance(entry["tags"], list)
+
+    def test_print_data_catalog_output(self):
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            print_data_catalog()
+            output = mock_out.getvalue()
+        self.assertIn("catGar Data Catalog", output)
+        self.assertIn("QUICK REFERENCE", output)
+        self.assertIn("DETAILED FIELD REFERENCE", output)
+        self.assertIn("USAGE NOTES", output)
+        self.assertIn("daily_stats", output)
+        self.assertIn("Total data categories: 17", output)
+
+    def test_print_data_catalog_includes_all_measurements(self):
+        with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
+            print_data_catalog()
+            output = mock_out.getvalue()
+        catalog = get_data_catalog()
+        for entry in catalog:
+            self.assertIn(entry["measurement"], output)
 
 
 if __name__ == "__main__":
