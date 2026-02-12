@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 from garminconnect import Garmin
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
+from influxdb_client.rest import ApiException
+from requests.exceptions import HTTPError
 
 load_dotenv()
 
@@ -75,9 +77,6 @@ def ensure_bucket(influx_client, bucket, org):
         sys.exit(1)
 
 
-# ---------------------------------------------------------------------------
-# Garmin data → InfluxDB points
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Garmin data → InfluxDB points
 # ---------------------------------------------------------------------------
@@ -370,13 +369,13 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
     errors = []
 
     def _is_no_data_not_found(exc):
-        resp = getattr(exc, "response", None)
-        if getattr(resp, "status_code", None) == 404:
-            return True
-        msg = str(exc).lower()
-        if "bucket" in msg:
+        if isinstance(exc, ApiException):
             return False
-        return "404" in msg and "not found" in msg
+        if isinstance(exc, HTTPError):
+            resp = getattr(exc, "response", None)
+            return getattr(resp, "status_code", None) == 404
+        resp = getattr(exc, "response", None)
+        return getattr(resp, "status_code", None) == 404
 
     collectors = [
         ("daily stats", lambda: build_daily_stats_points(garmin_client.get_stats(day_str), day_str)),
