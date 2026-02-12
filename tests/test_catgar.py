@@ -8,14 +8,25 @@ from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock, patch
 
 from catgar import (
+    _collect_extra_fields,
     _safe_float,
     build_activity_points,
     build_body_composition_points,
     build_daily_stats_points,
+    build_endurance_score_points,
+    build_fitnessage_points,
+    build_floors_points,
     build_heart_rate_points,
+    build_hill_score_points,
+    build_hrv_points,
+    build_hydration_points,
+    build_max_metrics_points,
     build_respiration_points,
     build_sleep_points,
     build_spo2_points,
+    build_stress_points,
+    build_training_readiness_points,
+    build_training_status_points,
     ensure_bucket,
     find_oldest_available_date,
     read_last_sync,
@@ -434,6 +445,270 @@ class TestEnsureBucket(unittest.TestCase):
             ensure_bucket(mock_client, "my_bucket", "org")
             mock_log.warning.assert_called_once()
             self.assertIn("finite retention", mock_log.warning.call_args[0][0])
+
+
+class TestCollectExtraFields(unittest.TestCase):
+    """Test the _collect_extra_fields helper for graceful discovery."""
+
+    def test_captures_unknown_numeric_fields(self):
+        data = {"known": 1, "unknown_field": 42.5, "another": 10}
+        extras = _collect_extra_fields(data, {"known"}, "test")
+        self.assertIn("unknown_field", extras)
+        self.assertEqual(extras["unknown_field"], 42.5)
+        self.assertIn("another", extras)
+
+    def test_skips_known_keys(self):
+        data = {"known": 1, "unknown": 2}
+        extras = _collect_extra_fields(data, {"known", "unknown"}, "test")
+        self.assertEqual(extras, {})
+
+    def test_skips_none_values(self):
+        data = {"extra": None}
+        extras = _collect_extra_fields(data, set(), "test")
+        self.assertEqual(extras, {})
+
+    def test_skips_dict_and_list_values(self):
+        data = {"nested": {"a": 1}, "arr": [1, 2]}
+        extras = _collect_extra_fields(data, set(), "test")
+        self.assertEqual(extras, {})
+
+    def test_skips_ignored_metadata_keys(self):
+        data = {"calendarDate": "2024-06-01", "userProfilePK": 12345, "newField": 99}
+        extras = _collect_extra_fields(data, set(), "test")
+        self.assertNotIn("calendarDate", extras)
+        self.assertNotIn("userProfilePK", extras)
+        self.assertIn("newField", extras)
+
+    def test_non_dict_input(self):
+        extras = _collect_extra_fields("not a dict", set(), "test")
+        self.assertEqual(extras, {})
+
+    def test_string_number_coerced(self):
+        data = {"strNum": "3.14"}
+        extras = _collect_extra_fields(data, set(), "test")
+        self.assertEqual(extras["strNum"], 3.14)
+
+    def test_unparseable_string_skipped(self):
+        data = {"badStr": "not_a_number"}
+        extras = _collect_extra_fields(data, set(), "test")
+        self.assertEqual(extras, {})
+
+
+class TestBuildStressPoints(unittest.TestCase):
+    def test_basic_stress(self):
+        data = {
+            "avgStressLevel": 35,
+            "maxStressLevel": 75,
+            "highStressDuration": 3600,
+            "lowStressDuration": 7200,
+        }
+        pts = build_stress_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 4)
+        for p in pts:
+            self.assertIn("stress", p.to_line_protocol())
+
+    def test_none_stress(self):
+        pts = build_stress_points(None, "2024-06-01")
+        self.assertEqual(pts, [])
+
+    def test_empty_stress(self):
+        pts = build_stress_points({}, "2024-06-01")
+        self.assertEqual(pts, [])
+
+    def test_extra_fields_captured(self):
+        data = {"avgStressLevel": 35, "brandNewField": 99}
+        pts = build_stress_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 2)
+        lp = " ".join(p.to_line_protocol() for p in pts)
+        self.assertIn("brandNewField", lp)
+
+
+class TestBuildHrvPoints(unittest.TestCase):
+    def test_basic_hrv(self):
+        data = {
+            "hrvSummary": {
+                "weeklyAvg": 45,
+                "lastNight": 42,
+                "lastNightAvg": 40,
+                "lastNight5MinHigh": 55,
+            }
+        }
+        pts = build_hrv_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 4)
+
+    def test_hrv_with_baseline(self):
+        data = {
+            "hrvSummary": {
+                "weeklyAvg": 45,
+                "baseline": {
+                    "lowUpper": 30,
+                    "balancedLow": 35,
+                    "balancedUpper": 55,
+                },
+            }
+        }
+        pts = build_hrv_points(data, "2024-06-01")
+        # 1 field + 3 baseline fields = 4
+        self.assertEqual(len(pts), 4)
+
+    def test_none_hrv(self):
+        pts = build_hrv_points(None, "2024-06-01")
+        self.assertEqual(pts, [])
+
+    def test_empty_hrv(self):
+        pts = build_hrv_points({}, "2024-06-01")
+        self.assertEqual(pts, [])
+
+    def test_flat_hrv_data(self):
+        """HRV data without hrvSummary wrapper."""
+        data = {"weeklyAvg": 45, "lastNight": 42}
+        pts = build_hrv_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 2)
+
+
+class TestBuildHydrationPoints(unittest.TestCase):
+    def test_basic_hydration(self):
+        data = {"valueInML": 2000, "goalInML": 2500}
+        pts = build_hydration_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 2)
+
+    def test_none_hydration(self):
+        pts = build_hydration_points(None, "2024-06-01")
+        self.assertEqual(pts, [])
+
+    def test_extra_hydration_fields(self):
+        data = {"valueInML": 2000, "someNewField": 123}
+        pts = build_hydration_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 2)
+
+
+class TestBuildTrainingReadinessPoints(unittest.TestCase):
+    def test_basic_readiness(self):
+        data = {"score": 72, "sleepScore": 80, "recoveryTime": 24}
+        pts = build_training_readiness_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 3)
+
+    def test_none_readiness(self):
+        pts = build_training_readiness_points(None, "2024-06-01")
+        self.assertEqual(pts, [])
+
+
+class TestBuildTrainingStatusPoints(unittest.TestCase):
+    def test_basic_status(self):
+        data = {"vo2MaxValue": 48.5, "trainingLoadBalance": 1.2}
+        pts = build_training_status_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 2)
+
+    def test_none_status(self):
+        pts = build_training_status_points(None, "2024-06-01")
+        self.assertEqual(pts, [])
+
+
+class TestBuildMaxMetricsPoints(unittest.TestCase):
+    def test_basic_max_metrics_list(self):
+        data = [
+            {"sport": "running", "vo2MaxPreciseValue": 48.5, "vo2MaxValue": 49},
+            {"sport": "cycling", "vo2MaxPreciseValue": 45.0},
+        ]
+        pts = build_max_metrics_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 2)
+        lp = pts[0].to_line_protocol()
+        self.assertIn("sport=running", lp)
+
+    def test_dict_with_max_metrics_key(self):
+        data = {"maxMetrics": [{"sport": "running", "vo2MaxValue": 49}]}
+        pts = build_max_metrics_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 1)
+
+    def test_none_max_metrics(self):
+        pts = build_max_metrics_points(None, "2024-06-01")
+        self.assertEqual(pts, [])
+
+    def test_empty_list(self):
+        pts = build_max_metrics_points([], "2024-06-01")
+        self.assertEqual(pts, [])
+
+
+class TestBuildEnduranceScorePoints(unittest.TestCase):
+    def test_basic_endurance(self):
+        data = {"overallScore": 55, "enduranceScore": 60}
+        pts = build_endurance_score_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 2)
+
+    def test_none_endurance(self):
+        pts = build_endurance_score_points(None, "2024-06-01")
+        self.assertEqual(pts, [])
+
+
+class TestBuildHillScorePoints(unittest.TestCase):
+    def test_basic_hill(self):
+        data = {"overallScore": 45, "hillScore": 50}
+        pts = build_hill_score_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 2)
+
+    def test_none_hill(self):
+        pts = build_hill_score_points(None, "2024-06-01")
+        self.assertEqual(pts, [])
+
+
+class TestBuildFitnessagePoints(unittest.TestCase):
+    def test_basic_fitnessage(self):
+        data = {
+            "fitnessAge": 28,
+            "chronologicalAge": 35,
+            "bmi": 23.5,
+        }
+        pts = build_fitnessage_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 3)
+
+    def test_none_fitnessage(self):
+        pts = build_fitnessage_points(None, "2024-06-01")
+        self.assertEqual(pts, [])
+
+
+class TestBuildFloorsPoints(unittest.TestCase):
+    def test_basic_floors(self):
+        data = {"floorsAscended": 12, "floorsDescended": 10}
+        pts = build_floors_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 2)
+
+    def test_none_floors(self):
+        pts = build_floors_points(None, "2024-06-01")
+        self.assertEqual(pts, [])
+
+
+class TestExtraFieldsInExistingBuilders(unittest.TestCase):
+    """Ensure existing builders now capture unknown numeric fields."""
+
+    def test_daily_stats_extra_field(self):
+        stats = {"totalSteps": 8500, "brandNewGarminField": 42}
+        pts = build_daily_stats_points(stats, "2024-06-01")
+        self.assertEqual(len(pts), 2)
+        lp = " ".join(p.to_line_protocol() for p in pts)
+        self.assertIn("brandNewGarminField", lp)
+
+    def test_body_composition_extra_field(self):
+        data = {"weight": 75000, "newBodyMetric": 1.5}
+        pts = build_body_composition_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 2)
+
+    def test_body_composition_skeletal_muscle_mass(self):
+        data = {"skeletalMuscleMass": 32000, "weightChange": -500}
+        pts = build_body_composition_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 2)
+        lp = " ".join(p.to_line_protocol() for p in pts)
+        self.assertIn("skeletal_muscle_mass_grams", lp)
+        self.assertIn("weight_change", lp)
+
+    def test_respiration_extra_field(self):
+        data = {"avgWakingRespirationValue": 16, "newRespField": 5}
+        pts = build_respiration_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 2)
+
+    def test_spo2_extra_field(self):
+        data = {"averageSpO2": 96, "newSpo2Metric": 88}
+        pts = build_spo2_points(data, "2024-06-01")
+        self.assertEqual(len(pts), 2)
 
 
 if __name__ == "__main__":
