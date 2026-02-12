@@ -1,0 +1,13 @@
+[Unit]
+Description=catGar — sync Garmin watch data to InfluxDB
+After=network-online.target influxdb.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/catgar
+ExecStart=/opt/catgar/venv/bin/python /opt/catgar/catgar.py
+EnvironmentFile=/opt/catgar/.env
+
+[Install]
+WantedBy=multi-user.target

@@ -47,7 +47,7 @@ cp .env.example .env
 ## Usage
 
 ```bash
-# Sync today's data
+# Sync since last sync (or today if first run)
 python catgar.py
 
 # Sync a specific date
@@ -56,8 +56,41 @@ python catgar.py 2024-06-15
 # Sync the last 7 days
 python catgar.py --days 7
 
-# Sync the last 30 days (initial backfill)
-python catgar.py --days 30
+# Initial backfill — all available data (up to 5 years)
+python catgar.py --backfill
+```
+
+### Raspberry Pi quick install
+
+If you have an existing InfluxDB instance running on a Raspberry Pi, a single
+command handles everything — system packages, Python venv, credentials, systemd
+timer (every 4 hours), and an initial full backfill:
+
+```bash
+git clone https://github.com/rotblauer/catGar.git
+cd catGar
+sudo bash install.sh
+```
+
+The installer will:
+
+1. Install `python3`, `pip`, `venv`, and `git` via `apt`.
+2. Copy the project to `/opt/catgar` and create a virtual environment.
+3. Prompt you for Garmin + InfluxDB credentials (writes `/opt/catgar/.env`).
+4. Install a **systemd timer** that runs the sync every **4 hours**.
+5. Kick off an initial **backfill** of all available historical data.
+
+After install you can check status with:
+
+```bash
+# Timer status
+systemctl status catgar.timer
+
+# Last run output
+journalctl -u catgar.service -e
+
+# Trigger a manual sync
+sudo systemctl start catgar.service
 ```
 
 ### Automate with cron (macOS / Linux)
