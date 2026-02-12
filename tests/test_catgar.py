@@ -1,7 +1,10 @@
 """Unit tests for catgar data transformation functions."""
 
+import json
+import os
+import tempfile
 import unittest
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from catgar import (
     build_activity_points,
@@ -11,6 +14,8 @@ from catgar import (
     build_respiration_points,
     build_sleep_points,
     build_spo2_points,
+    read_last_sync,
+    write_last_sync,
 )
 
 
@@ -215,6 +220,46 @@ class TestBuildSpO2Points(unittest.TestCase):
         data = {"averageSpO2": 95.0}
         pts = build_spo2_points(data, "2024-06-01")
         self.assertEqual(len(pts), 1)
+
+
+class TestLastSyncState(unittest.TestCase):
+    def setUp(self):
+        self.tmpfile = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        self.tmpfile.close()
+        self.state_path = self.tmpfile.name
+
+    def tearDown(self):
+        if os.path.exists(self.state_path):
+            os.unlink(self.state_path)
+
+    def test_read_missing_file(self):
+        os.unlink(self.state_path)
+        result = read_last_sync(self.state_path)
+        self.assertIsNone(result)
+
+    def test_write_and_read(self):
+        d = date(2024, 6, 15)
+        write_last_sync(d, self.state_path)
+        result = read_last_sync(self.state_path)
+        self.assertEqual(result, d)
+
+    def test_read_corrupt_file(self):
+        with open(self.state_path, "w") as f:
+            f.write("not json")
+        result = read_last_sync(self.state_path)
+        self.assertIsNone(result)
+
+    def test_read_missing_key(self):
+        with open(self.state_path, "w") as f:
+            json.dump({"other": "value"}, f)
+        result = read_last_sync(self.state_path)
+        self.assertIsNone(result)
+
+    def test_write_overwrites(self):
+        write_last_sync(date(2024, 1, 1), self.state_path)
+        write_last_sync(date(2024, 6, 15), self.state_path)
+        result = read_last_sync(self.state_path)
+        self.assertEqual(result, date(2024, 6, 15))
 
 
 if __name__ == "__main__":

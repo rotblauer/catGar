@@ -2,16 +2,19 @@
 """catGar — sync Garmin watch data to InfluxDB.
 
 Usage:
-    python catgar.py              # sync today's data
+    python catgar.py              # sync since last sync (or today if first run)
     python catgar.py 2024-01-15   # sync a specific date
     python catgar.py --days 7     # sync last 7 days
+    python catgar.py --backfill   # initial backfill of all available data
 """
 
 import argparse
+import json
 import logging
 import os
 import sys
 from datetime import date, datetime, timedelta
+from pathlib import Path
 
 from dotenv import load_dotenv
 from garminconnect import Garmin
@@ -25,6 +28,12 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("catgar")
+
+# Default path for last-sync state file (next to this script)
+DEFAULT_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_sync")
+
+# Maximum number of days to look back for a full backfill
+BACKFILL_MAX_DAYS = 365 * 5
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +313,31 @@ def build_spo2_points(spo2_data, day_str):
 
 
 # ---------------------------------------------------------------------------
+# Last-sync state helpers
+# ---------------------------------------------------------------------------
+
+def read_last_sync(state_file=DEFAULT_STATE_FILE):
+    """Read the last successful sync date from the state file.
+
+    Returns a date object, or None if no previous sync recorded.
+    """
+    path = Path(state_file)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+        return datetime.strptime(data["last_sync"], "%Y-%m-%d").date()
+    except (json.JSONDecodeError, KeyError, ValueError):
+        return None
+
+
+def write_last_sync(sync_date, state_file=DEFAULT_STATE_FILE):
+    """Write the last successful sync date to the state file."""
+    path = Path(state_file)
+    path.write_text(json.dumps({"last_sync": sync_date.strftime("%Y-%m-%d")}))
+
+
+# ---------------------------------------------------------------------------
 # Main sync logic
 # ---------------------------------------------------------------------------
 
@@ -354,7 +388,9 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
 def main():
     parser = argparse.ArgumentParser(description="Sync Garmin data to InfluxDB")
     parser.add_argument("date", nargs="?", default=None, help="Date to sync (YYYY-MM-DD). Defaults to today.")
-    parser.add_argument("--days", type=int, default=1, help="Number of past days to sync (default: 1 = today only)")
+    parser.add_argument("--days", type=int, default=None, help="Number of past days to sync")
+    parser.add_argument("--backfill", action="store_true", help="Backfill all available historical data (up to 5 years)")
+    parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help="Path to last-sync state file")
     args = parser.parse_args()
 
     cfg = get_config()
@@ -374,13 +410,36 @@ def main():
     write_api = influx.write_api(write_options=SYNCHRONOUS)
 
     # --- Determine dates ---
-    if args.date:
-        start = datetime.strptime(args.date, "%Y-%m-%d").date()
-        days = 1
-    else:
-        days = args.days
-        start = date.today() - timedelta(days=days - 1)
+    today = date.today()
 
+    if args.date:
+        # Explicit date: sync that single day
+        start = datetime.strptime(args.date, "%Y-%m-%d").date()
+        end = start
+    elif args.backfill:
+        # Full backfill: go back BACKFILL_MAX_DAYS
+        start = today - timedelta(days=BACKFILL_MAX_DAYS)
+        end = today
+        log.info("Backfill mode: syncing from %s to %s", start, end)
+    elif args.days is not None:
+        # Explicit --days flag
+        start = today - timedelta(days=args.days - 1)
+        end = today
+    else:
+        # Auto mode: sync since last sync, or just today if no state
+        last = read_last_sync(args.state_file)
+        if last is not None:
+            start = last + timedelta(days=1)
+            if start > today:
+                log.info("Already synced up to %s. Nothing to do.", last)
+                influx.close()
+                return
+            log.info("Resuming sync from %s (last sync: %s)", start, last)
+        else:
+            start = today
+        end = today
+
+    days = (end - start).days + 1
     grand_total = 0
     all_errors = []
 
@@ -394,6 +453,8 @@ def main():
 
     influx.close()
 
+    # Record last successful sync date
+    write_last_sync(end, args.state_file)
     log.info("Done. Wrote %d total points across %d day(s).", grand_total, days)
     if all_errors:
         log.warning("Encountered %d error(s) during sync.", len(all_errors))
