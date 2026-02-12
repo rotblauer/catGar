@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from garminconnect import Garmin
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
+from influxdb_client.domain.bucket_retention_rules import BucketRetentionRules
 from influxdb_client.rest import ApiException
 from requests.exceptions import HTTPError
 
@@ -63,14 +64,31 @@ def get_config():
 
 
 def ensure_bucket(influx_client, bucket, org):
-    """Ensure the target InfluxDB bucket exists, creating it if missing."""
+    """Ensure the target InfluxDB bucket exists with infinite retention.
+
+    Creates the bucket with no expiration (``every_seconds=0``) if missing.
+    If the bucket already exists, logs a warning when its retention policy
+    is not set to infinite so the operator can adjust it manually.
+    """
     buckets_api = influx_client.buckets_api()
     existing = buckets_api.find_bucket_by_name(bucket)
     if existing:
+        rules = existing.retention_rules or []
+        for rule in rules:
+            if rule.every_seconds and rule.every_seconds > 0:
+                log.warning(
+                    "Bucket '%s' has a finite retention of %d seconds. "
+                    "Data may be dropped. Consider setting retention to infinite (0).",
+                    bucket,
+                    rule.every_seconds,
+                )
         return
     try:
-        buckets_api.create_bucket(bucket_name=bucket, org=org)
-        log.info("Created missing InfluxDB bucket '%s'.", bucket)
+        retention = BucketRetentionRules(type="expire", every_seconds=0)
+        buckets_api.create_bucket(
+            bucket_name=bucket, org=org, retention_rules=[retention],
+        )
+        log.info("Created InfluxDB bucket '%s' with infinite retention.", bucket)
     except ApiException as exc:
         log.error("Failed to create bucket '%s': %s", bucket, exc)
         influx_client.close()
@@ -80,6 +98,17 @@ def ensure_bucket(influx_client, bucket, org):
 # ---------------------------------------------------------------------------
 # Garmin data → InfluxDB points
 # ---------------------------------------------------------------------------
+
+def _safe_float(val, field_name, measurement):
+    """Convert *val* to float, logging a warning on failure instead of raising."""
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        log.warning(
+            "Could not convert %s=%r to float for measurement '%s'; skipping field.",
+            field_name, val, measurement,
+        )
+        return None
 
 def build_daily_stats_points(stats, day_str):
     """Convert Garmin daily stats dict into InfluxDB Point objects."""
@@ -110,10 +139,13 @@ def build_daily_stats_points(stats, day_str):
     for garmin_key, influx_field in field_map.items():
         val = stats.get(garmin_key)
         if val is not None:
+            fval = _safe_float(val, garmin_key, "daily_stats")
+            if fval is None:
+                continue
             p = (
                 Point("daily_stats")
                 .time(ts, WritePrecision.S)
-                .field(influx_field, float(val))
+                .field(influx_field, fval)
             )
             points.append(p)
 
@@ -147,10 +179,13 @@ def build_sleep_points(sleep_data, day_str):
             continue
         val = summary.get(garmin_key)
         if val is not None:
+            fval = _safe_float(val, garmin_key, "sleep")
+            if fval is None:
+                continue
             p = (
                 Point("sleep")
                 .time(ts, WritePrecision.S)
-                .field(influx_field, float(val))
+                .field(influx_field, fval)
             )
             points.append(p)
 
@@ -164,10 +199,13 @@ def build_sleep_points(sleep_data, day_str):
             else:
                 val = score_obj
             if val is not None:
+                fval = _safe_float(val, f"score_{score_key}", "sleep")
+                if fval is None:
+                    continue
                 p = (
                     Point("sleep")
                     .time(ts, WritePrecision.S)
-                    .field(f"score_{score_key}", float(val))
+                    .field(f"score_{score_key}", fval)
                 )
                 points.append(p)
 
@@ -244,7 +282,10 @@ def build_activity_points(activities):
                 continue
             val = act.get(garmin_key)
             if val is not None:
-                p = p.field(influx_field, float(val))
+                fval = _safe_float(val, garmin_key, "activity")
+                if fval is None:
+                    continue
+                p = p.field(influx_field, fval)
                 has_fields = True
 
         if has_fields:
@@ -275,10 +316,13 @@ def build_body_composition_points(body_data, day_str):
     for garmin_key, influx_field in field_map.items():
         val = body_data.get(garmin_key)
         if val is not None:
+            fval = _safe_float(val, garmin_key, "body_composition")
+            if fval is None:
+                continue
             p = (
                 Point("body_composition")
                 .time(ts, WritePrecision.S)
-                .field(influx_field, float(val))
+                .field(influx_field, fval)
             )
             points.append(p)
 
@@ -303,10 +347,13 @@ def build_respiration_points(resp_data, day_str):
     for garmin_key, influx_field in field_map.items():
         val = resp_data.get(garmin_key)
         if val is not None:
+            fval = _safe_float(val, garmin_key, "respiration")
+            if fval is None:
+                continue
             p = (
                 Point("respiration")
                 .time(ts, WritePrecision.S)
-                .field(influx_field, float(val))
+                .field(influx_field, fval)
             )
             points.append(p)
 
@@ -324,10 +371,13 @@ def build_spo2_points(spo2_data, day_str):
     for key in ("averageSpO2", "lowestSpO2", "latestSpO2"):
         val = spo2_data.get(key)
         if val is not None:
+            fval = _safe_float(val, key, "spo2")
+            if fval is None:
+                continue
             p = (
                 Point("spo2")
                 .time(ts, WritePrecision.S)
-                .field(key, float(val))
+                .field(key, fval)
             )
             points.append(p)
 
@@ -357,6 +407,59 @@ def write_last_sync(sync_date, state_file=DEFAULT_STATE_FILE):
     """Write the last successful sync date to the state file."""
     path = Path(state_file)
     path.write_text(json.dumps({"last_sync": sync_date.strftime("%Y-%m-%d")}))
+
+
+# ---------------------------------------------------------------------------
+# Backfill helpers
+# ---------------------------------------------------------------------------
+
+def _probe_date(garmin_client, day_str):
+    """Return True if Garmin has any data for *day_str*."""
+    try:
+        stats = garmin_client.get_stats(day_str)
+        if stats and any(stats.get(k) is not None for k in ("totalSteps", "totalDistanceMeters", "restingHeartRate")):
+            return True
+    except HTTPError as exc:
+        resp = getattr(exc, "response", None)
+        if getattr(resp, "status_code", None) == 404:
+            return False
+    except Exception:
+        pass
+    return False
+
+
+def find_oldest_available_date(garmin_client, earliest, latest):
+    """Binary search for the oldest date with Garmin data.
+
+    Instead of checking every day from *earliest* to *latest*, this narrows
+    the window in O(log n) probes, then returns the first date that has data.
+    Returns *latest* if no data is found in the entire range.
+    """
+    low = 0
+    high = (latest - earliest).days
+
+    if high <= 0:
+        if _probe_date(garmin_client, latest.strftime("%Y-%m-%d")):
+            return latest
+        return latest
+
+    # Quick check: if the earliest date already has data, return it
+    if _probe_date(garmin_client, earliest.strftime("%Y-%m-%d")):
+        return earliest
+
+    # Quick check: if the latest date has no data, nothing to backfill
+    if not _probe_date(garmin_client, latest.strftime("%Y-%m-%d")):
+        return latest
+
+    while low < high:
+        mid = (low + high) // 2
+        mid_date = earliest + timedelta(days=mid)
+        if _probe_date(garmin_client, mid_date.strftime("%Y-%m-%d")):
+            high = mid
+        else:
+            low = mid + 1
+
+    return earliest + timedelta(days=low)
 
 
 # ---------------------------------------------------------------------------
@@ -454,8 +557,10 @@ def main():
         start = datetime.strptime(args.date, "%Y-%m-%d").date()
         end = start
     elif args.backfill:
-        # Full backfill: go back BACKFILL_MAX_DAYS
-        start = today - timedelta(days=BACKFILL_MAX_DAYS)
+        # Full backfill: binary-search for the oldest date with data
+        earliest = today - timedelta(days=BACKFILL_MAX_DAYS)
+        log.info("Backfill mode: searching for oldest data in %s … %s", earliest, today)
+        start = find_oldest_available_date(garmin, earliest, today)
         end = today
         log.info("Backfill mode: syncing from %s to %s", start, end)
     elif args.days is not None:
