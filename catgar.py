@@ -71,7 +71,7 @@ def ensure_bucket(influx_client, bucket, org):
     try:
         buckets_api.create_bucket(bucket_name=bucket, org=org)
         log.info("Created missing InfluxDB bucket '%s'.", bucket)
-    except Exception as exc:
+    except ApiException as exc:
         log.error("Failed to create bucket '%s': %s", bucket, exc)
         influx_client.close()
         sys.exit(1)
@@ -371,10 +371,9 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
     def _is_no_data_not_found(exc):
         if isinstance(exc, ApiException):
             return False
-        if isinstance(exc, HTTPError):
-            resp = getattr(exc, "response", None)
-            return getattr(resp, "status_code", None) == 404
         resp = getattr(exc, "response", None)
+        if isinstance(exc, HTTPError):
+            return getattr(resp, "status_code", None) == 404
         return getattr(resp, "status_code", None) == 404
 
     collectors = [
