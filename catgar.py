@@ -352,6 +352,238 @@ def build_activity_points(activities):
     return points
 
 
+def build_activity_detail_points(detail_data, activity_id, act_type, act_name, ts):
+    """Convert Garmin activity detail (``get_activity``) into InfluxDB Points.
+
+    Captures enriched per-activity metrics not available from the activities
+    list endpoint, such as training effect, performance condition, and
+    normalized power.
+    """
+    points = []
+    if not detail_data or not isinstance(detail_data, dict):
+        return points
+
+    summary = detail_data.get("summaryDTO") or detail_data
+    p = (
+        Point("activity_detail")
+        .tag("type", act_type)
+        .tag("name", act_name)
+        .tag("activity_id", str(activity_id))
+        .time(ts, WritePrecision.S)
+    )
+
+    field_map = {
+        "trainingEffect": "training_effect_aerobic",
+        "anaerobicTrainingEffect": "training_effect_anaerobic",
+        "aerobicTrainingEffectMessage": None,
+        "anaerobicTrainingEffectMessage": None,
+        "performanceCondition": "performance_condition",
+        "lactateThreshold": "lactate_threshold",
+        "normalizedPower": "normalized_power",
+        "groundContactTime": "ground_contact_time",
+        "groundContactBalanceLeft": "ground_contact_balance_left",
+        "strideLength": "stride_length",
+        "verticalOscillation": "vertical_oscillation",
+        "verticalRatio": "vertical_ratio",
+        "trainingStressScore": "training_stress_score",
+        "intensityFactor": "intensity_factor",
+        "functionalThresholdPower": "ftp",
+        "minTemperature": "min_temperature",
+        "maxTemperature": "max_temperature",
+        "minElevation": "min_elevation",
+        "maxElevation": "max_elevation",
+        "maxRunCadence": "max_cadence",
+        "maxBikeCadence": "max_bike_cadence",
+        "lapCount": "lap_count",
+        "waterEstimated": "water_estimated_ml",
+        "directWorkoutFeel": None,
+        "directWorkoutRpe": None,
+    }
+
+    has_fields = False
+    for garmin_key, influx_field in field_map.items():
+        if influx_field is None:
+            continue
+        val = summary.get(garmin_key)
+        if val is not None:
+            fval = _safe_float(val, garmin_key, "activity_detail")
+            if fval is None:
+                continue
+            p = p.field(influx_field, fval)
+            has_fields = True
+
+    if has_fields:
+        points.append(p)
+
+    return points
+
+
+def build_activity_split_points(splits_data, activity_id, act_type, act_name, ts):
+    """Convert Garmin activity splits into InfluxDB Points.
+
+    Creates one point per split/lap with distance, duration, pace, HR, and
+    other per-split metrics.
+    """
+    points = []
+    if not splits_data or not isinstance(splits_data, dict):
+        return points
+
+    lap_list = splits_data.get("lapDTOs") or splits_data.get("splitSummaries") or []
+    if not isinstance(lap_list, list):
+        return points
+
+    for idx, lap in enumerate(lap_list):
+        if not isinstance(lap, dict):
+            continue
+
+        p = (
+            Point("activity_split")
+            .tag("type", act_type)
+            .tag("name", act_name)
+            .tag("activity_id", str(activity_id))
+            .tag("split_num", str(idx + 1))
+            .time(ts, WritePrecision.S)
+        )
+
+        field_map = {
+            "distance": "distance_meters",
+            "duration": "duration_sec",
+            "movingDuration": "moving_sec",
+            "averageHR": "avg_hr",
+            "maxHR": "max_hr",
+            "averageSpeed": "avg_speed",
+            "maxSpeed": "max_speed",
+            "calories": "calories",
+            "elevationGain": "elevation_gain",
+            "elevationLoss": "elevation_loss",
+            "averageRunCadence": "avg_cadence",
+            "maxRunCadence": "max_cadence",
+            "averagePower": "avg_power",
+            "maxPower": "max_power",
+            "startLatitude": "start_lat",
+            "startLongitude": "start_lon",
+            "endLatitude": "end_lat",
+            "endLongitude": "end_lon",
+            "totalExerciseReps": "total_reps",
+            "messageIndex": None,
+        }
+
+        has_fields = False
+        for garmin_key, influx_field in field_map.items():
+            if influx_field is None:
+                continue
+            val = lap.get(garmin_key)
+            if val is not None:
+                fval = _safe_float(val, garmin_key, "activity_split")
+                if fval is None:
+                    continue
+                p = p.field(influx_field, fval)
+                has_fields = True
+
+        if has_fields:
+            points.append(p)
+
+    return points
+
+
+def build_activity_hr_zone_points(hr_zones_data, activity_id, act_type, act_name, ts):
+    """Convert Garmin activity HR-zone data into InfluxDB Points.
+
+    Creates one point per heart-rate zone with time-in-zone and zone boundaries.
+    """
+    points = []
+    if not hr_zones_data or not isinstance(hr_zones_data, (list, dict)):
+        return points
+
+    zones = hr_zones_data
+    if isinstance(hr_zones_data, dict):
+        zones = hr_zones_data.get("hrTimeInZones") or hr_zones_data.get("heartRateZones") or []
+
+    if not isinstance(zones, list):
+        return points
+
+    for zone in zones:
+        if not isinstance(zone, dict):
+            continue
+
+        zone_num = zone.get("zoneNumber") or zone.get("zone")
+        if zone_num is None:
+            continue
+
+        p = (
+            Point("activity_hr_zone")
+            .tag("type", act_type)
+            .tag("name", act_name)
+            .tag("activity_id", str(activity_id))
+            .tag("zone", str(zone_num))
+            .time(ts, WritePrecision.S)
+        )
+
+        field_map = {
+            "secsInZone": "secs_in_zone",
+            "zoneLowBoundary": "zone_low_bpm",
+            "zoneHighBoundary": "zone_high_bpm",
+        }
+
+        has_fields = False
+        for garmin_key, influx_field in field_map.items():
+            val = zone.get(garmin_key)
+            if val is not None:
+                fval = _safe_float(val, garmin_key, "activity_hr_zone")
+                if fval is None:
+                    continue
+                p = p.field(influx_field, fval)
+                has_fields = True
+
+        if has_fields:
+            points.append(p)
+
+    return points
+
+
+def build_activity_weather_points(weather_data, activity_id, act_type, act_name, ts):
+    """Convert Garmin activity weather data into InfluxDB Points."""
+    points = []
+    if not weather_data or not isinstance(weather_data, dict):
+        return points
+
+    p = (
+        Point("activity_weather")
+        .tag("type", act_type)
+        .tag("name", act_name)
+        .tag("activity_id", str(activity_id))
+        .time(ts, WritePrecision.S)
+    )
+
+    field_map = {
+        "temperature": "temperature_c",
+        "apparentTemperature": "feels_like_c",
+        "dewPoint": "dew_point_c",
+        "relativeHumidity": "humidity_pct",
+        "windDirection": "wind_direction_deg",
+        "windSpeed": "wind_speed_mps",
+        "windGust": "wind_gust_mps",
+        "weatherTypeDTO": None,
+    }
+
+    has_fields = False
+    for garmin_key, influx_field in field_map.items():
+        if influx_field is None:
+            continue
+        val = weather_data.get(garmin_key)
+        if val is not None:
+            fval = _safe_float(val, garmin_key, "activity_weather")
+            if fval is None:
+                continue
+            p = p.field(influx_field, fval)
+            has_fields = True
+
+    if has_fields:
+        points.append(p)
+
+    return points
+
+
 def build_body_composition_points(body_data, day_str):
     """Convert Garmin body composition data into InfluxDB Point objects."""
     points = []
@@ -999,6 +1231,51 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
             log.info("  activities: wrote %d points", len(pts))
         else:
             log.info("  activities: no data")
+
+        # Fetch detailed data for each activity.
+        for act in (activities or []):
+            act_id = act.get("activityId")
+            if not act_id:
+                continue
+            ts_str = act.get("startTimeLocal") or act.get("startTimeGMT")
+            if not ts_str:
+                continue
+            try:
+                ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+            except (ValueError, TypeError):
+                continue
+            act_type = act.get("activityType", {}).get("typeKey", "unknown")
+            act_name = act.get("activityName", "")
+
+            detail_collectors = [
+                ("activity details", lambda: build_activity_detail_points(
+                    garmin_client.get_activity(str(act_id)),
+                    act_id, act_type, act_name, ts)),
+                ("activity splits", lambda: build_activity_split_points(
+                    garmin_client.get_activity_splits(str(act_id)),
+                    act_id, act_type, act_name, ts)),
+                ("activity HR zones", lambda: build_activity_hr_zone_points(
+                    garmin_client.get_activity_hr_in_timezones(str(act_id)),
+                    act_id, act_type, act_name, ts)),
+                ("activity weather", lambda: build_activity_weather_points(
+                    garmin_client.get_activity_weather(str(act_id)),
+                    act_id, act_type, act_name, ts)),
+            ]
+
+            for dname, dcollect in detail_collectors:
+                try:
+                    dpts = dcollect()
+                    if dpts:
+                        influx_write_api.write(bucket=bucket, org=org, record=dpts)
+                        total += len(dpts)
+                        counts[dname] = counts.get(dname, 0) + len(dpts)
+                        log.info("    %s [%s]: wrote %d points", dname, act_id, len(dpts))
+                except Exception as dexc:
+                    if _is_no_data_not_found(dexc):
+                        log.debug("    %s [%s]: no data (not found)", dname, act_id)
+                    else:
+                        log.debug("    %s [%s]: error — %s", dname, act_id, dexc)
+
     except Exception as exc:
         if _is_no_data_not_found(exc):
             log.info("  activities: no data (not found)")
@@ -1145,6 +1422,91 @@ def get_data_catalog():
             ],
             "tags": ["type", "name"],
             "notes": "Tagged by activity type (running, cycling, etc.) and activity name. Zero or more per day.",
+        },
+        {
+            "measurement": "activity_detail",
+            "display_name": "activity details",
+            "description": "Enriched per-activity metrics: training effect, performance condition, running dynamics, and power metrics.",
+            "garmin_api": "get_activity(activity_id)",
+            "frequency": "per-activity",
+            "fields": [
+                {"garmin_key": "trainingEffect", "influx_field": "training_effect_aerobic", "description": "Aerobic training effect (0-5)"},
+                {"garmin_key": "anaerobicTrainingEffect", "influx_field": "training_effect_anaerobic", "description": "Anaerobic training effect (0-5)"},
+                {"garmin_key": "performanceCondition", "influx_field": "performance_condition", "description": "Real-time performance condition indicator"},
+                {"garmin_key": "lactateThreshold", "influx_field": "lactate_threshold", "description": "Estimated lactate threshold HR"},
+                {"garmin_key": "normalizedPower", "influx_field": "normalized_power", "description": "Normalized power (watts)"},
+                {"garmin_key": "groundContactTime", "influx_field": "ground_contact_time", "description": "Ground contact time (ms)"},
+                {"garmin_key": "strideLength", "influx_field": "stride_length", "description": "Average stride length (meters)"},
+                {"garmin_key": "verticalOscillation", "influx_field": "vertical_oscillation", "description": "Vertical oscillation (cm)"},
+                {"garmin_key": "verticalRatio", "influx_field": "vertical_ratio", "description": "Vertical ratio (%)"},
+                {"garmin_key": "trainingStressScore", "influx_field": "training_stress_score", "description": "Training Stress Score (TSS)"},
+                {"garmin_key": "intensityFactor", "influx_field": "intensity_factor", "description": "Intensity Factor (IF)"},
+                {"garmin_key": "minTemperature", "influx_field": "min_temperature", "description": "Minimum temperature during activity (°C)"},
+                {"garmin_key": "maxTemperature", "influx_field": "max_temperature", "description": "Maximum temperature during activity (°C)"},
+                {"garmin_key": "minElevation", "influx_field": "min_elevation", "description": "Minimum elevation (meters)"},
+                {"garmin_key": "maxElevation", "influx_field": "max_elevation", "description": "Maximum elevation (meters)"},
+                {"garmin_key": "lapCount", "influx_field": "lap_count", "description": "Number of laps/splits"},
+            ],
+            "tags": ["type", "name", "activity_id"],
+            "notes": "Fetched per-activity via get_activity(). Contains advanced running dynamics and training metrics.",
+        },
+        {
+            "measurement": "activity_split",
+            "display_name": "activity splits",
+            "description": "Per-split/lap breakdown of each activity with distance, pace, HR, elevation, and cadence.",
+            "garmin_api": "get_activity_splits(activity_id)",
+            "frequency": "per-split (multiple per activity)",
+            "fields": [
+                {"garmin_key": "distance", "influx_field": "distance_meters", "description": "Split distance in meters"},
+                {"garmin_key": "duration", "influx_field": "duration_sec", "description": "Split duration in seconds"},
+                {"garmin_key": "movingDuration", "influx_field": "moving_sec", "description": "Moving time in seconds"},
+                {"garmin_key": "averageHR", "influx_field": "avg_hr", "description": "Average heart rate (bpm)"},
+                {"garmin_key": "maxHR", "influx_field": "max_hr", "description": "Maximum heart rate (bpm)"},
+                {"garmin_key": "averageSpeed", "influx_field": "avg_speed", "description": "Average speed (m/s)"},
+                {"garmin_key": "maxSpeed", "influx_field": "max_speed", "description": "Maximum speed (m/s)"},
+                {"garmin_key": "calories", "influx_field": "calories", "description": "Calories burned in split"},
+                {"garmin_key": "elevationGain", "influx_field": "elevation_gain", "description": "Elevation gained in split (meters)"},
+                {"garmin_key": "elevationLoss", "influx_field": "elevation_loss", "description": "Elevation lost in split (meters)"},
+                {"garmin_key": "averageRunCadence", "influx_field": "avg_cadence", "description": "Average cadence (steps/min)"},
+                {"garmin_key": "startLatitude", "influx_field": "start_lat", "description": "Split start latitude"},
+                {"garmin_key": "startLongitude", "influx_field": "start_lon", "description": "Split start longitude"},
+                {"garmin_key": "endLatitude", "influx_field": "end_lat", "description": "Split end latitude"},
+                {"garmin_key": "endLongitude", "influx_field": "end_lon", "description": "Split end longitude"},
+            ],
+            "tags": ["type", "name", "activity_id", "split_num"],
+            "notes": "GPS coordinates per split enable map reconstruction. Tagged by split number within the activity.",
+        },
+        {
+            "measurement": "activity_hr_zone",
+            "display_name": "activity HR zones",
+            "description": "Time spent in each heart-rate zone during an activity.",
+            "garmin_api": "get_activity_hr_in_timezones(activity_id)",
+            "frequency": "per-zone (typically 5 zones per activity)",
+            "fields": [
+                {"garmin_key": "secsInZone", "influx_field": "secs_in_zone", "description": "Seconds spent in this HR zone"},
+                {"garmin_key": "zoneLowBoundary", "influx_field": "zone_low_bpm", "description": "Zone lower boundary (bpm)"},
+                {"garmin_key": "zoneHighBoundary", "influx_field": "zone_high_bpm", "description": "Zone upper boundary (bpm)"},
+            ],
+            "tags": ["type", "name", "activity_id", "zone"],
+            "notes": "Typically 5 HR zones per activity. Useful for training intensity analysis.",
+        },
+        {
+            "measurement": "activity_weather",
+            "display_name": "activity weather",
+            "description": "Weather conditions (temperature, humidity, wind) during an activity.",
+            "garmin_api": "get_activity_weather(activity_id)",
+            "frequency": "per-activity",
+            "fields": [
+                {"garmin_key": "temperature", "influx_field": "temperature_c", "description": "Temperature (°C)"},
+                {"garmin_key": "apparentTemperature", "influx_field": "feels_like_c", "description": "Apparent/feels-like temperature (°C)"},
+                {"garmin_key": "dewPoint", "influx_field": "dew_point_c", "description": "Dew point temperature (°C)"},
+                {"garmin_key": "relativeHumidity", "influx_field": "humidity_pct", "description": "Relative humidity (%)"},
+                {"garmin_key": "windDirection", "influx_field": "wind_direction_deg", "description": "Wind direction (degrees)"},
+                {"garmin_key": "windSpeed", "influx_field": "wind_speed_mps", "description": "Wind speed (m/s)"},
+                {"garmin_key": "windGust", "influx_field": "wind_gust_mps", "description": "Wind gust speed (m/s)"},
+            ],
+            "tags": ["type", "name", "activity_id"],
+            "notes": "Correlate weather with performance. Not available for indoor activities.",
         },
         {
             "measurement": "body_composition",
