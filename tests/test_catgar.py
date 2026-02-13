@@ -15,7 +15,11 @@ from catgar import (
     _collect_extra_fields,
     _format_stat_value,
     _safe_float,
+    build_activity_detail_points,
+    build_activity_hr_zone_points,
     build_activity_points,
+    build_activity_split_points,
+    build_activity_weather_points,
     build_body_composition_points,
     build_daily_stats_points,
     build_endurance_score_points,
@@ -208,6 +212,150 @@ class TestBuildActivityPoints(unittest.TestCase):
             }
         ]
         pts = build_activity_points(activities)
+        self.assertEqual(pts, [])
+
+
+class TestBuildActivityDetailPoints(unittest.TestCase):
+    _TS = datetime(2024, 6, 1, 7, 30, 0)
+
+    def test_basic_detail(self):
+        data = {
+            "summaryDTO": {
+                "trainingEffect": 3.5,
+                "anaerobicTrainingEffect": 2.1,
+                "performanceCondition": 5,
+                "lapCount": 3,
+            }
+        }
+        pts = build_activity_detail_points(data, 123, "running", "Morning Run", self._TS)
+        self.assertEqual(len(pts), 1)
+        lp = pts[0].to_line_protocol()
+        self.assertIn("activity_detail", lp)
+        self.assertIn("type=running", lp)
+        self.assertIn("activity_id=123", lp)
+        self.assertIn("training_effect_aerobic=3.5", lp)
+        self.assertIn("performance_condition=5", lp)
+
+    def test_empty_data(self):
+        pts = build_activity_detail_points({}, 1, "r", "n", self._TS)
+        self.assertEqual(pts, [])
+
+    def test_none_data(self):
+        pts = build_activity_detail_points(None, 1, "r", "n", self._TS)
+        self.assertEqual(pts, [])
+
+    def test_no_numeric_fields_skipped(self):
+        data = {"summaryDTO": {"aerobicTrainingEffectMessage": "improving"}}
+        pts = build_activity_detail_points(data, 1, "r", "n", self._TS)
+        self.assertEqual(pts, [])
+
+
+class TestBuildActivitySplitPoints(unittest.TestCase):
+    _TS = datetime(2024, 6, 1, 7, 30, 0)
+
+    def test_basic_splits(self):
+        data = {
+            "lapDTOs": [
+                {"distance": 1000.0, "duration": 300.0, "averageHR": 150, "calories": 80},
+                {"distance": 1000.0, "duration": 310.0, "averageHR": 155, "calories": 85},
+            ]
+        }
+        pts = build_activity_split_points(data, 42, "running", "Run", self._TS)
+        self.assertEqual(len(pts), 2)
+        lp0 = pts[0].to_line_protocol()
+        self.assertIn("activity_split", lp0)
+        self.assertIn("split_num=1", lp0)
+        self.assertIn("distance_meters=1000", lp0)
+        lp1 = pts[1].to_line_protocol()
+        self.assertIn("split_num=2", lp1)
+
+    def test_empty_data(self):
+        pts = build_activity_split_points({}, 1, "r", "n", self._TS)
+        self.assertEqual(pts, [])
+
+    def test_none_data(self):
+        pts = build_activity_split_points(None, 1, "r", "n", self._TS)
+        self.assertEqual(pts, [])
+
+    def test_split_with_gps(self):
+        data = {
+            "lapDTOs": [
+                {"distance": 1000.0, "startLatitude": 40.7, "startLongitude": -74.0,
+                 "endLatitude": 40.71, "endLongitude": -74.01},
+            ]
+        }
+        pts = build_activity_split_points(data, 1, "running", "R", self._TS)
+        self.assertEqual(len(pts), 1)
+        lp = pts[0].to_line_protocol()
+        self.assertIn("start_lat=40.7", lp)
+
+    def test_non_dict_laps_skipped(self):
+        data = {"lapDTOs": ["not_a_dict"]}
+        pts = build_activity_split_points(data, 1, "r", "n", self._TS)
+        self.assertEqual(pts, [])
+
+
+class TestBuildActivityHrZonePoints(unittest.TestCase):
+    _TS = datetime(2024, 6, 1, 7, 30, 0)
+
+    def test_basic_hr_zones(self):
+        data = [
+            {"zoneNumber": 1, "secsInZone": 600, "zoneLowBoundary": 100, "zoneHighBoundary": 120},
+            {"zoneNumber": 2, "secsInZone": 900, "zoneLowBoundary": 120, "zoneHighBoundary": 140},
+        ]
+        pts = build_activity_hr_zone_points(data, 10, "running", "Run", self._TS)
+        self.assertEqual(len(pts), 2)
+        lp = pts[0].to_line_protocol()
+        self.assertIn("activity_hr_zone", lp)
+        self.assertIn("zone=1", lp)
+        self.assertIn("secs_in_zone=600", lp)
+
+    def test_dict_with_nested_zones(self):
+        data = {
+            "hrTimeInZones": [
+                {"zoneNumber": 1, "secsInZone": 300, "zoneLowBoundary": 90, "zoneHighBoundary": 110},
+            ]
+        }
+        pts = build_activity_hr_zone_points(data, 1, "r", "n", self._TS)
+        self.assertEqual(len(pts), 1)
+
+    def test_empty_data(self):
+        pts = build_activity_hr_zone_points([], 1, "r", "n", self._TS)
+        self.assertEqual(pts, [])
+
+    def test_none_data(self):
+        pts = build_activity_hr_zone_points(None, 1, "r", "n", self._TS)
+        self.assertEqual(pts, [])
+
+    def test_zone_without_number_skipped(self):
+        data = [{"secsInZone": 300}]
+        pts = build_activity_hr_zone_points(data, 1, "r", "n", self._TS)
+        self.assertEqual(pts, [])
+
+
+class TestBuildActivityWeatherPoints(unittest.TestCase):
+    _TS = datetime(2024, 6, 1, 7, 30, 0)
+
+    def test_basic_weather(self):
+        data = {"temperature": 22.5, "relativeHumidity": 65, "windSpeed": 3.2}
+        pts = build_activity_weather_points(data, 99, "running", "Run", self._TS)
+        self.assertEqual(len(pts), 1)
+        lp = pts[0].to_line_protocol()
+        self.assertIn("activity_weather", lp)
+        self.assertIn("temperature_c=22.5", lp)
+        self.assertIn("humidity_pct=65", lp)
+
+    def test_empty_data(self):
+        pts = build_activity_weather_points({}, 1, "r", "n", self._TS)
+        self.assertEqual(pts, [])
+
+    def test_none_data(self):
+        pts = build_activity_weather_points(None, 1, "r", "n", self._TS)
+        self.assertEqual(pts, [])
+
+    def test_non_numeric_skipped(self):
+        data = {"weatherTypeDTO": {"description": "Sunny"}}
+        pts = build_activity_weather_points(data, 1, "r", "n", self._TS)
         self.assertEqual(pts, [])
 
 
@@ -836,7 +984,7 @@ class TestGetDataCatalog(unittest.TestCase):
 
     def test_catalog_returns_all_categories(self):
         catalog = get_data_catalog()
-        self.assertEqual(len(catalog), 17)
+        self.assertEqual(len(catalog), 21)
 
     def test_catalog_entry_structure(self):
         catalog = get_data_catalog()
@@ -867,7 +1015,8 @@ class TestGetDataCatalog(unittest.TestCase):
             "respiration", "SpO2", "stress", "HRV", "hydration",
             "training readiness", "training status", "max metrics",
             "endurance score", "hill score", "fitness age", "floors",
-            "activities",
+            "activities", "activity details", "activity splits",
+            "activity HR zones", "activity weather",
         }
         self.assertEqual(display_names, expected)
 
@@ -885,7 +1034,7 @@ class TestGetDataCatalog(unittest.TestCase):
         self.assertIn("DETAILED FIELD REFERENCE", output)
         self.assertIn("USAGE NOTES", output)
         self.assertIn("daily_stats", output)
-        self.assertIn("Total data categories: 17", output)
+        self.assertIn("Total data categories: 21", output)
 
     def test_print_data_catalog_includes_all_measurements(self):
         with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
