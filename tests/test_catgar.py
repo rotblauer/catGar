@@ -19,6 +19,7 @@ from catgar import (
     build_activity_hr_zone_points,
     build_activity_points,
     build_activity_split_points,
+    build_activity_track_points,
     build_activity_weather_points,
     build_body_composition_points,
     build_daily_stats_points,
@@ -357,6 +358,119 @@ class TestBuildActivityWeatherPoints(unittest.TestCase):
         data = {"weatherTypeDTO": {"description": "Sunny"}}
         pts = build_activity_weather_points(data, 1, "r", "n", self._TS)
         self.assertEqual(pts, [])
+
+
+class TestBuildActivityTrackPoints(unittest.TestCase):
+    _TS = datetime(2024, 6, 1, 7, 30, 0)
+
+    def _make_detail_data(self, lat_idx=0, lon_idx=1, metrics_list=None):
+        """Helper to create a minimal get_activity_details response."""
+        data = {
+            "metricDescriptors": [
+                {"metricsIndex": lat_idx, "key": "directLatitude",
+                 "unit": {"id": 60, "key": "dd", "factor": 1.0}},
+                {"metricsIndex": lon_idx, "key": "directLongitude",
+                 "unit": {"id": 60, "key": "dd", "factor": 1.0}},
+            ],
+            "activityDetailMetrics": metrics_list or [],
+        }
+        return data
+
+    def test_basic_track(self):
+        data = self._make_detail_data(metrics_list=[
+            {"metrics": [44.165, 7.569]},
+            {"metrics": [44.170, 7.575]},
+        ])
+        pts = build_activity_track_points(data, 123, "running", "Morning Run", self._TS)
+        self.assertEqual(len(pts), 2)
+        lp0 = pts[0].to_line_protocol()
+        self.assertIn("activity_track", lp0)
+        self.assertIn("activity_id=123", lp0)
+        self.assertIn("type=running", lp0)
+        self.assertIn("point_idx=0", lp0)
+        self.assertIn("lat=44.165", lp0)
+        self.assertIn("lon=7.569", lp0)
+        lp1 = pts[1].to_line_protocol()
+        self.assertIn("point_idx=1", lp1)
+        self.assertIn("lat=44.17", lp1)
+
+    def test_empty_data(self):
+        pts = build_activity_track_points({}, 1, "r", "n", self._TS)
+        self.assertEqual(pts, [])
+
+    def test_none_data(self):
+        pts = build_activity_track_points(None, 1, "r", "n", self._TS)
+        self.assertEqual(pts, [])
+
+    def test_missing_descriptors(self):
+        data = {"activityDetailMetrics": [{"metrics": [1.0, 2.0]}]}
+        pts = build_activity_track_points(data, 1, "r", "n", self._TS)
+        self.assertEqual(pts, [])
+
+    def test_missing_lat_lon_descriptors(self):
+        data = {
+            "metricDescriptors": [
+                {"metricsIndex": 0, "key": "directHeartRate"},
+            ],
+            "activityDetailMetrics": [{"metrics": [140.0]}],
+        }
+        pts = build_activity_track_points(data, 1, "r", "n", self._TS)
+        self.assertEqual(pts, [])
+
+    def test_none_lat_lon_skipped(self):
+        data = self._make_detail_data(metrics_list=[
+            {"metrics": [None, 7.5]},
+            {"metrics": [44.0, None]},
+            {"metrics": [44.0, 7.5]},
+        ])
+        pts = build_activity_track_points(data, 1, "r", "n", self._TS)
+        self.assertEqual(len(pts), 1)
+        lp = pts[0].to_line_protocol()
+        self.assertIn("point_idx=2", lp)
+
+    def test_extra_metrics_captured(self):
+        data = {
+            "metricDescriptors": [
+                {"metricsIndex": 0, "key": "directLatitude"},
+                {"metricsIndex": 1, "key": "directLongitude"},
+                {"metricsIndex": 2, "key": "directHeartRate"},
+                {"metricsIndex": 3, "key": "directSpeed"},
+            ],
+            "activityDetailMetrics": [
+                {"metrics": [44.0, 7.5, 150.0, 3.5]},
+            ],
+        }
+        pts = build_activity_track_points(data, 1, "running", "R", self._TS)
+        self.assertEqual(len(pts), 1)
+        lp = pts[0].to_line_protocol()
+        self.assertIn("directHeartRate=150", lp)
+        self.assertIn("directSpeed=3.5", lp)
+
+    def test_non_dict_metrics_entry_skipped(self):
+        data = self._make_detail_data(metrics_list=["not_a_dict"])
+        pts = build_activity_track_points(data, 1, "r", "n", self._TS)
+        self.assertEqual(pts, [])
+
+    def test_realistic_descriptor_order(self):
+        """Test with lat/lon at non-zero indices, mimicking real Garmin responses."""
+        data = {
+            "metricDescriptors": [
+                {"metricsIndex": 0, "key": "directTimestamp"},
+                {"metricsIndex": 1, "key": "directHeartRate"},
+                {"metricsIndex": 2, "key": "directLatitude"},
+                {"metricsIndex": 3, "key": "directLongitude"},
+                {"metricsIndex": 4, "key": "directSpeed"},
+            ],
+            "activityDetailMetrics": [
+                {"metrics": [1742659476000.0, 98.0, 44.165, 7.569, 0.0]},
+                {"metrics": [1742659480000.0, 138.0, 44.170, 7.575, 4.2]},
+            ],
+        }
+        pts = build_activity_track_points(data, 42, "running", "Run", self._TS)
+        self.assertEqual(len(pts), 2)
+        lp0 = pts[0].to_line_protocol()
+        self.assertIn("lat=44.165", lp0)
+        self.assertIn("lon=7.569", lp0)
 
 
 class TestBuildBodyCompositionPoints(unittest.TestCase):
@@ -984,7 +1098,7 @@ class TestGetDataCatalog(unittest.TestCase):
 
     def test_catalog_returns_all_categories(self):
         catalog = get_data_catalog()
-        self.assertEqual(len(catalog), 21)
+        self.assertEqual(len(catalog), 22)
 
     def test_catalog_entry_structure(self):
         catalog = get_data_catalog()
@@ -1016,7 +1130,7 @@ class TestGetDataCatalog(unittest.TestCase):
             "training readiness", "training status", "max metrics",
             "endurance score", "hill score", "fitness age", "floors",
             "activities", "activity details", "activity splits",
-            "activity HR zones", "activity weather",
+            "activity HR zones", "activity weather", "activity track",
         }
         self.assertEqual(display_names, expected)
 
@@ -1034,7 +1148,7 @@ class TestGetDataCatalog(unittest.TestCase):
         self.assertIn("DETAILED FIELD REFERENCE", output)
         self.assertIn("USAGE NOTES", output)
         self.assertIn("daily_stats", output)
-        self.assertIn("Total data categories: 21", output)
+        self.assertIn("Total data categories: 22", output)
 
     def test_print_data_catalog_includes_all_measurements(self):
         with patch("sys.stdout", new_callable=io.StringIO) as mock_out:
