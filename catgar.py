@@ -418,6 +418,79 @@ def build_activity_detail_points(detail_data, activity_id, act_type, act_name, t
     return points
 
 
+def build_activity_track_points(detail_data, activity_id, act_type, act_name, ts):
+    """Convert Garmin activity details (``get_activity_details``) GPS data into InfluxDB Points.
+
+    Extracts high-resolution GPS track points from the ``activityDetailMetrics``
+    array using the ``metricDescriptors`` to locate ``directLatitude`` and
+    ``directLongitude`` indices.  Creates one ``activity_track`` point per
+    GPS sample, enabling full-resolution route reconstruction.
+    """
+    points = []
+    if not detail_data or not isinstance(detail_data, dict):
+        return points
+
+    descriptors = detail_data.get("metricDescriptors")
+    metrics_list = detail_data.get("activityDetailMetrics")
+    if not descriptors or not metrics_list:
+        return points
+
+    # Build index mapping from descriptor key to array position.
+    key_to_idx = {}
+    for desc in descriptors:
+        key = desc.get("key")
+        idx = desc.get("metricsIndex")
+        if key is not None and idx is not None:
+            key_to_idx[key] = idx
+
+    lat_idx = key_to_idx.get("directLatitude")
+    lon_idx = key_to_idx.get("directLongitude")
+    if lat_idx is None or lon_idx is None:
+        return points
+
+    for point_num, entry in enumerate(metrics_list):
+        metrics = entry.get("metrics") if isinstance(entry, dict) else None
+        if not metrics:
+            continue
+        if lat_idx >= len(metrics) or lon_idx >= len(metrics):
+            continue
+
+        raw_lat = metrics[lat_idx]
+        raw_lon = metrics[lon_idx]
+        lat = _safe_float(raw_lat, "directLatitude", "activity_track")
+        lon = _safe_float(raw_lon, "directLongitude", "activity_track")
+        if lat is None or lon is None:
+            continue
+
+        p = (
+            Point("activity_track")
+            .tag("activity_id", str(activity_id))
+            .tag("type", act_type)
+            .tag("name", act_name)
+            .tag("point_idx", str(point_num))
+            .time(ts, WritePrecision.S)
+            .field("lat", lat)
+            .field("lon", lon)
+        )
+
+        # Capture additional numeric metrics available at this track point.
+        for desc_key, desc_idx in key_to_idx.items():
+            if desc_key in ("directLatitude", "directLongitude"):
+                continue
+            if desc_idx >= len(metrics):
+                continue
+            val = metrics[desc_idx]
+            if val is None:
+                continue
+            fval = _safe_float(val, desc_key, "activity_track")
+            if fval is not None:
+                p = p.field(desc_key, fval)
+
+        points.append(p)
+
+    return points
+
+
 def build_activity_split_points(splits_data, activity_id, act_type, act_name, ts):
     """Convert Garmin activity splits into InfluxDB Points.
 
@@ -1260,6 +1333,9 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
                 ("activity weather", lambda: build_activity_weather_points(
                     garmin_client.get_activity_weather(str(act_id)),
                     act_id, act_type, act_name, ts)),
+                ("activity track", lambda: build_activity_track_points(
+                    garmin_client.get_activity_details(str(act_id), maxpoly=4000),
+                    act_id, act_type, act_name, ts)),
             ]
 
             for dname, dcollect in detail_collectors:
@@ -1507,6 +1583,19 @@ def get_data_catalog():
             ],
             "tags": ["type", "name", "activity_id"],
             "notes": "Correlate weather with performance. Not available for indoor activities.",
+        },
+        {
+            "measurement": "activity_track",
+            "display_name": "activity track",
+            "description": "High-resolution GPS track points extracted from activity details, enabling full route reconstruction.",
+            "garmin_api": "get_activity_details(activity_id, maxpoly=4000)",
+            "frequency": "per-point (hundreds to thousands per activity)",
+            "fields": [
+                {"garmin_key": "directLatitude", "influx_field": "lat", "description": "Latitude in decimal degrees"},
+                {"garmin_key": "directLongitude", "influx_field": "lon", "description": "Longitude in decimal degrees"},
+            ],
+            "tags": ["type", "name", "activity_id", "point_idx"],
+            "notes": "Full-resolution GPS track. Additional per-point metrics (HR, speed, elevation, cadence, etc.) are auto-captured when available.",
         },
         {
             "measurement": "body_composition",
