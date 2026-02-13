@@ -1272,7 +1272,7 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
                         log.info("    %s [%s]: wrote %d points", dname, act_id, len(dpts))
                 except Exception as dexc:
                     if _is_no_data_not_found(dexc):
-                        log.info("    %s [%s]: no data (not found)", dname, act_id)
+                        log.debug("    %s [%s]: no data (not found)", dname, act_id)
                     else:
                         log.debug("    %s [%s]: error — %s", dname, act_id, dexc)
 
