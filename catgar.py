@@ -2251,19 +2251,17 @@ def main():
         start = today - timedelta(days=args.days - 1)
         end = today
     else:
-        # Auto mode: sync since last sync, or just today if no state
+        # Auto mode: re-sync from the last synced day through today.
+        #
+        # Start at `last` (INCLUSIVE), not `last + 1`: the current day's data
+        # keeps accumulating after each sync (workouts, HR, sleep all land
+        # later in the day), so the last synced day is almost always stale and
+        # must be re-pulled. InfluxDB upserts on matching timestamp+tags, so
+        # re-writing a day overwrites in place rather than duplicating.
         last = read_last_sync(args.state_file)
-        if last is not None:
-            start = last + timedelta(days=1)
-            if start > today:
-                log.info("Already synced up to %s. Nothing to do.", last)
-                influx.close()
-                return
-
-            log.info("Resuming sync from %s (last sync: %s)", start, last)
-        else:
-            start = today
+        start = last if last is not None else today
         end = today
+        log.info("Syncing from %s through %s (last sync: %s)", start, end, last)
 
     days = (end - start).days + 1
     grand_total = 0
