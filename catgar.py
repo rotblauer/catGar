@@ -6,6 +6,8 @@ Usage:
     python catgar.py 2024-01-15   # sync a specific date
     python catgar.py --days 7     # sync last 7 days
     python catgar.py --backfill   # initial backfill of all available data
+    python catgar.py --days 30 --only "daily stats,sleep"   # re-pull some categories
+    python catgar.py --version
 """
 
 import argparse
@@ -34,11 +36,18 @@ logging.basicConfig(
 )
 log = logging.getLogger("catgar")
 
+# Shown at the start of every run and by --version, so an installed copy can be
+# compared with the repository (bump it with every change to catgar.py).
+__version__ = "2026.10.24"
+
 # Default path for last-sync state file (next to this script)
 DEFAULT_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_sync")
 
 # Maximum number of days to look back for a full backfill
 BACKFILL_MAX_DAYS = 365 * 5
+
+# Auto mode re-pulls this many days before the last synced day (see auto_sync_start()).
+AUTO_LOOKBACK_DAYS = 1
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +124,7 @@ def _safe_float(val, field_name, measurement):
 
 # Keys that are metadata / non-numeric and should never be treated as fields.
 _IGNORED_GENERIC_KEYS = frozenset({
+    "userId", "deviceId",
     "calendarDate", "startTimestampGMT", "endTimestampGMT",
     "startTimestampLocal", "endTimestampLocal",
     "userProfilePK", "startOfDayGMT", "startOfDayLocal",
@@ -270,25 +280,69 @@ def build_sleep_points(sleep_data, day_str):
     return points
 
 
-def build_heart_rate_points(hr_data, day_str):
-    """Convert Garmin heart-rate data into InfluxDB Point objects."""
-    points = []
+def _local_offset_ms(entry, which="start"):
+    """Local minus GMT (ms) from a wellness response's ``<which>Timestamp*``
+    stamps, or None when they are missing or unreadable."""
+    def _parse(s):
+        if not isinstance(s, str):
+            return None
+        try:
+            return datetime.strptime(s.split(".")[0], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return None
+    gmt = _parse(entry.get(which + "TimestampGMT"))
+    local = _parse(entry.get(which + "TimestampLocal"))
+    if gmt is None or local is None:
+        return None
+    return int((local - gmt).total_seconds() * 1000)
 
+
+def _zone_local_ms(ts_ms, tz=None):
+    """A true instant (epoch ms) as the clock digits of zone *tz* (default: this
+    machine's zone), returned as epoch ms of those digits read as UTC."""
+    instant = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+    local = instant.astimezone(tz) if tz is not None else instant.astimezone()
+    return int(local.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def build_heart_rate_points(hr_data, day_str, tz=None):
+    """Convert Garmin heart-rate data into InfluxDB Point objects.
+
+    ``get_heart_rates()`` returns ONE dict for the day (``heartRateValues`` is a
+    list of ``[epoch_ms, bpm]`` pairs); iterating it as a list found no entries,
+    so no ``heart_rate`` point was ever written.  A list of dicts is still
+    accepted.  The samples are true instants (GMT); they are shifted to local
+    clock digits like every other catGar stamp, by the day's own local-minus-GMT
+    offset.  When the day's start and end offsets differ (a clock-change day) or
+    the stamps are missing, each sample goes through zone *tz* instead (default:
+    this machine's zone).
+    """
+    points = []
+    if isinstance(hr_data, dict):
+        hr_data = [hr_data]
     for entry in (hr_data or []):
         if not isinstance(entry, dict):
             continue
         hr_values = entry.get("heartRateValues")
         if not hr_values or not isinstance(hr_values, (list, tuple)):
             continue
+        offset_ms = _local_offset_ms(entry, "start")
+        end_offset_ms = _local_offset_ms(entry, "end")
+        if offset_ms is None:
+            log.warning("heart rate %s: no start stamps; using this machine's time zone", day_str)
+        elif end_offset_ms is not None and end_offset_ms != offset_ms:
+            offset_ms = None  # the clock changed during the day
         for pair in hr_values:
             if not isinstance(pair, (list, tuple)) or len(pair) != 2:
                 continue
             ts_ms, hr = pair
             if hr is None or ts_ms is None:
                 continue
+            ts_ms = int(ts_ms)
+            local_ms = ts_ms + offset_ms if offset_ms is not None else _zone_local_ms(ts_ms, tz)
             p = (
                 Point("heart_rate")
-                .time(int(ts_ms), WritePrecision.MS)
+                .time(local_ms, WritePrecision.MS)
                 .field("bpm", int(hr))
             )
             points.append(p)
@@ -865,10 +919,12 @@ def build_hrv_points(hrv_data, day_str):
     points = []
     ts = datetime.strptime(day_str, "%Y-%m-%d")
 
-    if not hrv_data:
+    if not isinstance(hrv_data, dict) or not hrv_data:
         return points
 
     summary = hrv_data.get("hrvSummary", hrv_data)
+    if not isinstance(summary, dict):  # "hrvSummary": null on a night without HRV
+        return points
 
     field_map = {
         "weeklyAvg": "weekly_avg",
@@ -949,51 +1005,154 @@ def build_hydration_points(hydration_data, day_str):
     return points
 
 
+_TRAINING_READINESS_FIELDS = {
+    "score": "score",
+    "sleepScore": "sleep_score",
+    "recoveryTime": "recovery_time",
+    "acuteLoad": "acute_load",
+    "hrvStatus": "hrv_status",
+    "trainingLoad": "training_load",
+    "hrvWeeklyAverage": "hrv_weekly_avg",
+    "sleepScoreFactorPercent": "sleep_factor_pct",
+    "sleepHistoryFactorPercent": "sleep_history_factor_pct",
+    "recoveryTimeFactorPercent": "recovery_factor_pct",
+    "acwrFactorPercent": "acwr_factor_pct",
+    "stressHistoryFactorPercent": "stress_history_factor_pct",
+    "hrvFactorPercent": "hrv_factor_pct",
+}
+
+
+def _readiness_snapshot(readiness_data):
+    """The day's readiness: the morning snapshot (``AFTER_WAKEUP_RESET``), else
+    the latest one.  ``get_training_readiness()`` returns a list of snapshots
+    taken through the day; a flat dict is still accepted."""
+    if isinstance(readiness_data, dict):
+        return readiness_data
+    snaps = [s for s in (readiness_data or []) if isinstance(s, dict)]
+    if not snaps:
+        return None
+    morning = [s for s in snaps if s.get("inputContext") == "AFTER_WAKEUP_RESET"]
+    by_time = lambda s: str(s.get("timestampLocal") or s.get("timestamp") or "")
+    return max(morning or snaps, key=by_time)
+
+
 def build_training_readiness_points(readiness_data, day_str):
     """Convert Garmin training readiness data into InfluxDB Point objects."""
     points = []
     ts = datetime.strptime(day_str, "%Y-%m-%d")
 
-    if not readiness_data:
+    snapshot = _readiness_snapshot(readiness_data)
+    if not snapshot:
         return points
 
-    field_map = {
-        "score": "score",
-        "sleepScore": "sleep_score",
-        "recoveryTime": "recovery_time",
-        "acuteLoad": "acute_load",
-        "hrvStatus": "hrv_status",
-        "trainingLoad": "training_load",
-    }
-
-    for garmin_key, influx_field in field_map.items():
-        val = readiness_data.get(garmin_key)
-        if val is not None:
-            fval = _safe_float(val, garmin_key, "training_readiness")
-            if fval is None:
-                continue
-            p = (
-                Point("training_readiness")
-                .time(ts, WritePrecision.S)
-                .field(influx_field, fval)
-            )
-            points.append(p)
-
-    for key, fval in _collect_extra_fields(readiness_data, set(field_map), "training_readiness").items():
-        p = Point("training_readiness").time(ts, WritePrecision.S).field(key, fval)
-        points.append(p)
+    fields = _numeric_fields(snapshot, _TRAINING_READINESS_FIELDS, "training_readiness")
+    for key, fval in fields.items():
+        points.append(Point("training_readiness").time(ts, WritePrecision.S).field(key, fval))
 
     return points
 
 
+def _primary_device_entry(device_map):
+    """Garmin keys some training blocks by device id: the primary training
+    device's entry (else the first)."""
+    if not isinstance(device_map, dict):
+        return None
+    entries = [v for v in device_map.values() if isinstance(v, dict)]
+    primary = [e for e in entries if e.get("primaryTrainingDevice")]
+    return (primary or entries or [None])[0]
+
+
+def _numeric_fields(data, field_map, measurement, prefix=""):
+    """``{influx_field: float}`` for the mapped keys of *data*, plus its other
+    numeric keys as ``prefix + key``.  Booleans, text (dates, Garmin's phrases)
+    and nested blocks are not readings and are skipped without a warning."""
+    out = {}
+    if not isinstance(data, dict):
+        return out
+    for garmin_key, influx_field in field_map.items():
+        val = data.get(garmin_key)
+        if influx_field is None or val is None or isinstance(val, bool):
+            continue
+        fval = _safe_float(val, garmin_key, measurement)
+        if fval is not None:
+            out[influx_field] = fval
+    numbers = {k: v for k, v in data.items() if not isinstance(v, (bool, str))}
+    for key, fval in _collect_extra_fields(numbers, set(field_map), measurement).items():
+        out[prefix + key] = fval
+    return out
+
+
+_TRAINING_STATUS_FIELDS = {
+    "trainingStatus": "status",
+    "weeklyTrainingLoad": "weekly_load",
+    "loadTunnelMin": "load_tunnel_min",
+    "loadTunnelMax": "load_tunnel_max",
+    "loadLevelTrend": "load_level_trend",
+    "fitnessTrend": "fitness_trend",
+    "timestamp": None, "sinceDate": None, "primaryTrainingDevice": None, "trainingPaused": None,
+}
+_ACUTE_LOAD_FIELDS = {
+    "dailyTrainingLoadAcute": "acute_load",
+    "dailyTrainingLoadChronic": "chronic_load",
+    "maxTrainingLoadChronic": "chronic_load_max",
+    "minTrainingLoadChronic": "chronic_load_min",
+    "dailyAcuteChronicWorkloadRatio": "acwr",
+    "acwrPercent": "acwr_percent",
+}
+_LOAD_BALANCE_FIELDS = {
+    "monthlyLoadAerobicLow": "load_aerobic_low",
+    "monthlyLoadAerobicHigh": "load_aerobic_high",
+    "monthlyLoadAnaerobic": "load_anaerobic",
+    "monthlyLoadAerobicLowTargetMin": "load_aerobic_low_target_min",
+    "monthlyLoadAerobicLowTargetMax": "load_aerobic_low_target_max",
+    "monthlyLoadAerobicHighTargetMin": "load_aerobic_high_target_min",
+    "monthlyLoadAerobicHighTargetMax": "load_aerobic_high_target_max",
+    "monthlyLoadAnaerobicTargetMin": "load_anaerobic_target_min",
+    "monthlyLoadAnaerobicTargetMax": "load_anaerobic_target_max",
+    "primaryTrainingDevice": None,
+}
+# Garmin's own words for the status and the load balance ("PRODUCTIVE_1",
+# "AEROBIC_LOW_SHORTAGE"), kept as text: the numeric status code has no published key.
+_TRAINING_STATUS_PHRASES = {
+    "trainingStatusFeedbackPhrase": "status_phrase",
+    "trainingBalanceFeedbackPhrase": "balance_phrase",
+}
+
+
+def _entry_day(entry, day_str):
+    """The day a per-device training entry describes (its ``calendarDate``),
+    else *day_str*."""
+    try:
+        return datetime.strptime(entry.get("calendarDate"), "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return datetime.strptime(day_str, "%Y-%m-%d")
+
+
+def _phrases(entry):
+    return {field: entry[key] for key, field in _TRAINING_STATUS_PHRASES.items()
+            if isinstance(entry.get(key), str) and entry[key]}
+
+
 def build_training_status_points(status_data, day_str):
-    """Convert Garmin training status data into InfluxDB Point objects."""
+    """Convert Garmin training status data into InfluxDB Point objects.
+
+    ``get_training_status()`` nests its numbers: the status under
+    ``mostRecentTrainingStatus.latestTrainingStatusData.<deviceId>`` (with the
+    acute/chronic load in its ``acuteTrainingLoadDTO``) and the monthly load
+    balance under ``mostRecentTrainingLoadBalance.metricsTrainingLoadBalanceDTOMap
+    .<deviceId>``.  Only top-level numbers were read, so the measurement held
+    nothing but ``userId``.  The primary training device's entries are read;
+    a flat dict (older callers, the unit tests) is still accepted.  VO2 max is
+    written by ``build_max_metrics_points``.
+
+    Each entry is the most recent one as of *day_str*, so it is stamped at its
+    own ``calendarDate``: a day without a watch sync re-writes the last entry
+    where it belongs instead of copying it onto that day.
+    """
     points = []
     ts = datetime.strptime(day_str, "%Y-%m-%d")
-
-    if not status_data:
+    if not isinstance(status_data, dict) or not status_data:
         return points
-
     field_map = {
         "trainingLoadBalance": "load_balance",
         "ltTimestamp": "lt_timestamp",
@@ -1002,29 +1161,47 @@ def build_training_status_points(status_data, day_str):
         "lactateThresholdHeartRate": "lt_heart_rate",
         "lactateThresholdSpeed": "lt_speed",
     }
-
-    for garmin_key, influx_field in field_map.items():
-        val = status_data.get(garmin_key)
-        if val is not None:
-            fval = _safe_float(val, garmin_key, "training_status")
-            if fval is None:
-                continue
-            p = (
-                Point("training_status")
-                .time(ts, WritePrecision.S)
-                .field(influx_field, fval)
-            )
-            points.append(p)
-
-    for key, fval in _collect_extra_fields(status_data, set(field_map), "training_status").items():
-        p = Point("training_status").time(ts, WritePrecision.S).field(key, fval)
-        points.append(p)
-
+    by_day = {ts: _numeric_fields(status_data, field_map, "training_status")}
+    recent = status_data.get("mostRecentTrainingStatus")
+    status = _primary_device_entry(recent.get("latestTrainingStatusData")) if isinstance(recent, dict) else None
+    if status:
+        fields = by_day.setdefault(_entry_day(status, day_str), {})
+        fields.update(_numeric_fields(status, _TRAINING_STATUS_FIELDS, "training_status", "status_"))
+        fields.update(_numeric_fields(status.get("acuteTrainingLoadDTO"), _ACUTE_LOAD_FIELDS, "training_status", "load_"))
+        fields.update(_phrases(status))
+    balance = status_data.get("mostRecentTrainingLoadBalance")
+    bal = _primary_device_entry(balance.get("metricsTrainingLoadBalanceDTOMap")) if isinstance(balance, dict) else None
+    if bal:
+        fields = by_day.setdefault(_entry_day(bal, day_str), {})
+        fields.update(_numeric_fields(bal, _LOAD_BALANCE_FIELDS, "training_status", "balance_"))
+        fields.update(_phrases(bal))
+    for day_ts, fields in by_day.items():
+        for key, val in fields.items():
+            points.append(Point("training_status").time(day_ts, WritePrecision.S).field(key, val))
     return points
 
 
+_MAX_METRIC_SPORTS = ("generic", "running", "cycling")
+# The heatAltitudeAcclimation block of max metrics; the previous* values are the
+# same series a day earlier.
+_ACCLIMATION_FIELDS = {
+    "heatAcclimationPercentage": "heat_acclimation_pct",
+    "altitudeAcclimation": "altitude_acclimation",
+    "acclimationPercentage": "acclimation_pct",
+    "currentAltitude": "current_altitude",
+    "previousHeatAcclimationPercentage": None,
+    "previousAltitudeAcclimation": None,
+    "previousAcclimationPercentage": None,
+    "previousAltitude": None,
+}
+
+
 def build_max_metrics_points(metrics_data, day_str):
-    """Convert Garmin max metrics (VO2 max, etc.) into InfluxDB Point objects."""
+    """Convert Garmin max metrics (VO2 max, etc.) into InfluxDB Point objects.
+
+    Writes ``max_metrics`` (one point per sport block, tagged ``sport``) and
+    ``heat_altitude_acclimation`` (from the same response).
+    """
     points = []
     ts = datetime.strptime(day_str, "%Y-%m-%d")
 
@@ -1039,10 +1216,30 @@ def build_max_metrics_points(metrics_data, day_str):
     else:
         entries = [metrics_data]
 
+    # The live response is a list of {"userId", "generic": {...}, "cycling": {...},
+    # "heatAltitudeAcclimation": {...}}: the VO2 numbers sit one level down, per
+    # sport, so reading the top level found only userId.  Flatten each sport block
+    # into its own entry (tagged with that sport); flat entries pass unchanged.
+    flat = []
     for entry in entries:
         if not isinstance(entry, dict):
             continue
+        blocks = [(k, v) for k, v in entry.items()
+                  if k in _MAX_METRIC_SPORTS and isinstance(v, dict)]
+        acclim = entry.get("heatAltitudeAcclimation")
+        if isinstance(acclim, dict):
+            fields = _numeric_fields(acclim, _ACCLIMATION_FIELDS, "heat_altitude_acclimation")
+            if fields:
+                p = Point("heat_altitude_acclimation").time(ts, WritePrecision.S)
+                for key, fval in fields.items():
+                    p = p.field(key, fval)
+                points.append(p)
+        if blocks:
+            flat.extend(dict(v, sport=k) for k, v in blocks)
+        elif not isinstance(acclim, dict):
+            flat.append(entry)
 
+    for entry in flat:
         sport = entry.get("sport", entry.get("metricsType", "generic"))
 
         field_map = {
@@ -1050,6 +1247,7 @@ def build_max_metrics_points(metrics_data, day_str):
             "vo2MaxValue": "vo2max",
             "fitnessAge": "fitness_age",
             "fitnessAgeDescription": None,  # string
+            "maxMetCategory": None,  # a category code, not a reading
         }
 
         has_fields = False
@@ -1298,8 +1496,11 @@ def find_oldest_available_date(garmin_client, earliest, latest):
 # Main sync logic
 # ---------------------------------------------------------------------------
 
-def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
+def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str, only=None):
     """Fetch all Garmin data for *day_str* and write to InfluxDB.
+
+    *only* (a set of collector names, see ``COLLECTOR_NAMES``) limits the pull to
+    those categories, e.g. to re-pull ``{"daily stats", "sleep"}`` for a range.
 
     Returns ``(total_points, errors, counts)`` where *counts* is a dict
     mapping measurement name to the number of points written.
@@ -1336,6 +1537,8 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
     ]
 
     for name, collect in collectors:
+        if only is not None and name not in only:
+            continue
         try:
             pts = collect()
             if pts:
@@ -1351,6 +1554,9 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
             else:
                 log.warning("  %s: error — %s", name, exc)
                 errors.append((name, exc))
+
+    if only is not None and "activities" not in only:
+        return total, errors, counts
 
     # Activities are not date-range specific; get recent ones.
     try:
@@ -1421,8 +1627,47 @@ def fetch_and_write(garmin_client, influx_write_api, bucket, org, day_str):
     return total, errors, counts
 
 
-def print_sync_summary(grand_counts, days, all_errors):
-    """Print a TUI-style summary table of the sync results."""
+def auto_sync_start(last, today):
+    """First day auto mode syncs: the day before the last synced day (its
+    evening and that night's sleep arrive after midnight), or today on a
+    first run.  Never later than today."""
+    if last is None:
+        return today
+    return min(last - timedelta(days=AUTO_LOOKBACK_DAYS), today)
+
+
+def last_sync_after(last, end, whole_run):
+    """The last-synced day to record after a run without errors: *end*, never
+    earlier than *last*.  None (keep the file as it is) after a partial run
+    (--only, or one date): it must not mark days done that the timer still owes."""
+    if not whole_run:
+        return None
+    return max(end, last) if last else end
+
+
+# The categories fetch_and_write() pulls, for --only.
+COLLECTOR_NAMES = (
+    "daily stats", "sleep", "heart rate", "body composition", "respiration", "SpO2",
+    "stress", "HRV", "hydration", "training readiness", "training status",
+    "max metrics", "endurance score", "hill score", "fitness age", "floors", "activities",
+)
+
+
+def parse_only(text):
+    """``"daily stats, sleep"`` -> ``{"daily stats", "sleep"}`` (case-insensitive);
+    an unknown name raises ValueError listing the valid ones."""
+    by_lower = {n.lower(): n for n in COLLECTOR_NAMES}
+    names = [t.strip().lower() for t in text.split(",") if t.strip()]
+    unknown = [n for n in names if n not in by_lower]
+    if unknown or not names:
+        raise ValueError("unknown --only name(s): %s; valid: %s"
+                         % (", ".join(unknown) or "(none)", ", ".join(COLLECTOR_NAMES)))
+    return {by_lower[n] for n in names}
+
+
+def print_sync_summary(grand_counts, days, all_errors, only=None):
+    """Print a TUI-style summary table of the sync results (categories left
+    out by --only show as "skipped")."""
     print()
     print("┌──────────────────────────────────────────┐")
     print("│           catGar Sync Summary            │")
@@ -1430,13 +1675,10 @@ def print_sync_summary(grand_counts, days, all_errors):
     print("│ Measurement            │ Points Written  │")
     print("├────────────────────────┼─────────────────┤")
     grand_total = 0
-    for name in (
-        "daily stats", "sleep", "heart rate", "body composition",
-        "respiration", "SpO2", "stress", "HRV", "hydration",
-        "training readiness", "training status", "max metrics",
-        "endurance score", "hill score", "fitness age", "floors",
-        "activities",
-    ):
+    for name in COLLECTOR_NAMES:
+        if only is not None and name not in only:
+            print(f"│ - {name:<20} │ {'skipped':>15} │")
+            continue
         count = grand_counts.get(name, 0)
         grand_total += count
         marker = "✓" if count > 0 else "·"
@@ -1522,14 +1764,14 @@ def get_data_catalog():
         {
             "measurement": "heart_rate",
             "display_name": "heart rate",
-            "description": "Continuous heart rate readings throughout the day, typically every 15-60 seconds.",
+            "description": "Continuous heart rate readings throughout the day, one every 2 minutes.",
             "garmin_api": "get_heart_rates(date)",
-            "frequency": "per-reading (sub-minute intervals)",
+            "frequency": "per-reading (every 2 minutes)",
             "fields": [
                 {"garmin_key": "heartRateValues[timestamp_ms, bpm]", "influx_field": "bpm", "description": "Heart rate in beats per minute"},
             ],
             "tags": [],
-            "notes": "High-frequency time series. Timestamps are in milliseconds. Expect 500-2000+ points per day.",
+            "notes": "High-frequency time series, about 720 points per day. Garmin sends true (GMT) instants; they are stored as local clock digits like every other catGar stamp.",
         },
         {
             "measurement": "activity",
@@ -1675,8 +1917,8 @@ def get_data_catalog():
                 {"garmin_key": "weightChange", "influx_field": "weight_change", "description": "Weight change from previous measurement"},
                 {"garmin_key": "physiqueRating", "influx_field": "physique_rating", "description": "Body physique rating"},
             ],
-            "tags": [],
-            "notes": "Requires a Garmin-compatible smart scale. Weight is in grams (divide by 1000 for kg).",
+            "tags": ["source"],
+            "notes": "Requires a Garmin-compatible smart scale or manual entries. One point per weigh-in at its local time, tagged source (INDEX_SCALE, MANUAL, ...). Weight is in grams (divide by 1000 for kg).",
         },
         {
             "measurement": "respiration",
@@ -1766,30 +2008,50 @@ def get_data_catalog():
             "fields": [
                 {"garmin_key": "score", "influx_field": "score", "description": "Overall training readiness score (0-100)"},
                 {"garmin_key": "sleepScore", "influx_field": "sleep_score", "description": "Sleep contribution to readiness"},
-                {"garmin_key": "recoveryTime", "influx_field": "recovery_time", "description": "Recommended recovery time (hours)"},
+                {"garmin_key": "recoveryTime", "influx_field": "recovery_time", "description": "Recommended recovery time (minutes)"},
                 {"garmin_key": "acuteLoad", "influx_field": "acute_load", "description": "Recent training load (acute)"},
-                {"garmin_key": "hrvStatus", "influx_field": "hrv_status", "description": "HRV status score"},
-                {"garmin_key": "trainingLoad", "influx_field": "training_load", "description": "Current training load value"},
+                {"garmin_key": "hrvWeeklyAverage", "influx_field": "hrv_weekly_avg", "description": "7-day HRV average (ms)"},
+                {"garmin_key": "sleepScoreFactorPercent", "influx_field": "sleep_factor_pct", "description": "Sleep factor (% of its best)"},
+                {"garmin_key": "sleepHistoryFactorPercent", "influx_field": "sleep_history_factor_pct", "description": "Sleep history factor (%)"},
+                {"garmin_key": "recoveryTimeFactorPercent", "influx_field": "recovery_factor_pct", "description": "Recovery time factor (%)"},
+                {"garmin_key": "acwrFactorPercent", "influx_field": "acwr_factor_pct", "description": "Acute load factor (%)"},
+                {"garmin_key": "stressHistoryFactorPercent", "influx_field": "stress_history_factor_pct", "description": "Stress history factor (%)"},
+                {"garmin_key": "hrvFactorPercent", "influx_field": "hrv_factor_pct", "description": "HRV status factor (%)"},
             ],
             "tags": [],
-            "notes": "Higher scores = more ready to train. Below 33 suggests rest is needed.",
+            "notes": "Garmin takes several snapshots a day; the morning one (AFTER_WAKEUP_RESET) is stored, else the latest. Higher scores = more ready to train. Below 33 suggests rest is needed.",
         },
         {
             "measurement": "training_status",
             "display_name": "training status",
-            "description": "Training load balance, VO2 max, and lactate threshold metrics.",
+            "description": "Training status, weekly and acute/chronic training load, and the monthly load balance.",
             "garmin_api": "get_training_status(date)",
             "frequency": "daily",
             "fields": [
-                {"garmin_key": "trainingLoadBalance", "influx_field": "load_balance", "description": "Training load balance ratio"},
-                {"garmin_key": "ltTimestamp", "influx_field": "lt_timestamp", "description": "Lactate threshold test timestamp"},
-                {"garmin_key": "vo2MaxValue", "influx_field": "vo2max", "description": "VO2 max estimate (ml/kg/min)"},
-                {"garmin_key": "loadFocus", "influx_field": "load_focus", "description": "Training load focus area"},
-                {"garmin_key": "lactateThresholdHeartRate", "influx_field": "lt_heart_rate", "description": "Heart rate at lactate threshold (bpm)"},
-                {"garmin_key": "lactateThresholdSpeed", "influx_field": "lt_speed", "description": "Speed at lactate threshold (m/s)"},
+                {"garmin_key": "trainingStatus", "influx_field": "status", "description": "Training status code"},
+                {"garmin_key": "weeklyTrainingLoad", "influx_field": "weekly_load", "description": "7-day training load"},
+                {"garmin_key": "loadTunnelMin", "influx_field": "load_tunnel_min", "description": "Low end of the optimal weekly load"},
+                {"garmin_key": "loadTunnelMax", "influx_field": "load_tunnel_max", "description": "High end of the optimal weekly load"},
+                {"garmin_key": "loadLevelTrend", "influx_field": "load_level_trend", "description": "Load level trend code"},
+                {"garmin_key": "fitnessTrend", "influx_field": "fitness_trend", "description": "Fitness trend code"},
+                {"garmin_key": "acuteTrainingLoadDTO.dailyTrainingLoadAcute", "influx_field": "acute_load", "description": "Acute (7-day) training load"},
+                {"garmin_key": "acuteTrainingLoadDTO.dailyTrainingLoadChronic", "influx_field": "chronic_load", "description": "Chronic (28-day) training load"},
+                {"garmin_key": "acuteTrainingLoadDTO.minTrainingLoadChronic", "influx_field": "chronic_load_min", "description": "Low end of the optimal chronic load"},
+                {"garmin_key": "acuteTrainingLoadDTO.maxTrainingLoadChronic", "influx_field": "chronic_load_max", "description": "High end of the optimal chronic load"},
+                {"garmin_key": "acuteTrainingLoadDTO.dailyAcuteChronicWorkloadRatio", "influx_field": "acwr", "description": "Acute:chronic workload ratio"},
+                {"garmin_key": "acuteTrainingLoadDTO.acwrPercent", "influx_field": "acwr_percent", "description": "Acute:chronic ratio (%)"},
+                {"garmin_key": "monthlyLoadAerobicLow", "influx_field": "load_aerobic_low", "description": "4-week low aerobic load"},
+                {"garmin_key": "monthlyLoadAerobicHigh", "influx_field": "load_aerobic_high", "description": "4-week high aerobic load"},
+                {"garmin_key": "monthlyLoadAnaerobic", "influx_field": "load_anaerobic", "description": "4-week anaerobic load"},
+                {"garmin_key": "monthlyLoadAerobicLowTargetMin", "influx_field": "load_aerobic_low_target_min", "description": "Low aerobic target, low end"},
+                {"garmin_key": "monthlyLoadAerobicLowTargetMax", "influx_field": "load_aerobic_low_target_max", "description": "Low aerobic target, high end"},
+                {"garmin_key": "monthlyLoadAerobicHighTargetMin", "influx_field": "load_aerobic_high_target_min", "description": "High aerobic target, low end"},
+                {"garmin_key": "monthlyLoadAerobicHighTargetMax", "influx_field": "load_aerobic_high_target_max", "description": "High aerobic target, high end"},
+                {"garmin_key": "monthlyLoadAnaerobicTargetMin", "influx_field": "load_anaerobic_target_min", "description": "Anaerobic target, low end"},
+                {"garmin_key": "monthlyLoadAnaerobicTargetMax", "influx_field": "load_anaerobic_target_max", "description": "Anaerobic target, high end"},
             ],
             "tags": [],
-            "notes": "Advanced training metrics. VO2 max is a key indicator of cardiovascular fitness.",
+            "notes": "Read from the primary training device under mostRecentTrainingStatus and mostRecentTrainingLoadBalance, stamped at each entry's own calendarDate. Watches without acute load leave the acute/chronic fields out. Garmin's own labels are kept as text fields status_phrase (e.g. PRODUCTIVE_1) and balance_phrase. VO2 max is in max_metrics.",
         },
         {
             "measurement": "max_metrics",
@@ -1803,7 +2065,22 @@ def get_data_catalog():
                 {"garmin_key": "fitnessAge", "influx_field": "fitness_age", "description": "Estimated fitness age (years)"},
             ],
             "tags": ["sport"],
-            "notes": "Tagged by sport (running, cycling, etc.). May contain multiple entries per day.",
+            "notes": "Tagged by sport block (generic = running/walking, cycling). May contain multiple entries per day.",
+        },
+        {
+            "measurement": "heat_altitude_acclimation",
+            "display_name": "heat & altitude acclimation",
+            "description": "Heat and altitude acclimation, from the same response as max metrics.",
+            "garmin_api": "get_max_metrics(date)",
+            "frequency": "daily",
+            "fields": [
+                {"garmin_key": "heatAcclimationPercentage", "influx_field": "heat_acclimation_pct", "description": "Heat acclimation (%)"},
+                {"garmin_key": "altitudeAcclimation", "influx_field": "altitude_acclimation", "description": "Altitude acclimation"},
+                {"garmin_key": "acclimationPercentage", "influx_field": "acclimation_pct", "description": "Acclimation (%)"},
+                {"garmin_key": "currentAltitude", "influx_field": "current_altitude", "description": "Current altitude"},
+            ],
+            "tags": [],
+            "notes": "Pulled with max metrics (the --only name is \"max metrics\").",
         },
         {
             "measurement": "endurance_score",
@@ -2254,7 +2531,14 @@ def main():
     parser.add_argument("--catalog-summary", action="store_true", help="Query InfluxDB and print a summary of actual data with statistics, then exit")
     parser.add_argument("--catalog-days", type=int, default=7, help="Number of days to include in --catalog-summary (default: 7)")
     parser.add_argument("--state-file", default=DEFAULT_STATE_FILE, help="Path to last-sync state file")
+    parser.add_argument("--only", default=None,
+                        help='Comma-separated categories to pull, e.g. "daily stats,sleep" (default: all)')
+    parser.add_argument("--version", action="version", version="catGar " + __version__)
     args = parser.parse_args()
+    try:
+        only = parse_only(args.only) if args.only is not None else None
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.catalog:
         print_data_catalog()
@@ -2275,6 +2559,7 @@ def main():
         return
 
     cfg = get_config()
+    log.info("catGar %s", __version__)
 
     # --- Garmin login ---
     log.info("Logging in to Garmin Connect…")
@@ -2310,15 +2595,16 @@ def main():
         start = today - timedelta(days=args.days - 1)
         end = today
     else:
-        # Auto mode: re-sync from the last synced day through today.
+        # Auto mode: re-sync from the day BEFORE the last synced day through today.
         #
-        # Start at `last` (INCLUSIVE), not `last + 1`: the current day's data
-        # keeps accumulating after each sync (workouts, HR, sleep all land
-        # later in the day), so the last synced day is almost always stale and
-        # must be re-pulled. InfluxDB upserts on matching timestamp+tags, so
-        # re-writing a day overwrites in place rather than duplicating.
+        # A day's data keeps arriving after it ends: the watch syncs the
+        # evening's steps and minutes, and that night's sleep, the next morning.
+        # Starting at `last` gave each day its final pull just after midnight,
+        # so its totals stayed cut short. Re-pulling the day before every run
+        # gives yesterday a whole day of re-syncs. InfluxDB upserts on matching
+        # timestamp+tags, so re-writing a day overwrites in place.
         last = read_last_sync(args.state_file)
-        start = last if last is not None else today
+        start = auto_sync_start(last, today)
         end = today
         log.info("Syncing from %s through %s (last sync: %s)", start, end, last)
 
@@ -2331,7 +2617,7 @@ def main():
         day = start + timedelta(days=i)
         day_str = day.strftime("%Y-%m-%d")
         log.info("Syncing %s …", day_str)
-        total, errors, counts = fetch_and_write(garmin, write_api, cfg["INFLUXDB_BUCKET"], cfg["INFLUXDB_ORG"], day_str)
+        total, errors, counts = fetch_and_write(garmin, write_api, cfg["INFLUXDB_BUCKET"], cfg["INFLUXDB_ORG"], day_str, only)
         grand_total += total
         all_errors.extend(errors)
         for name, cnt in counts.items():
@@ -2339,11 +2625,14 @@ def main():
 
     influx.close()
 
-    # Record last successful sync date (only if no errors)
+    # Record the last synced day only after a whole run without errors.
     if not all_errors:
-        write_last_sync(end, args.state_file)
+        new_last = last_sync_after(read_last_sync(args.state_file), end,
+                                   whole_run=only is None and not args.date)
+        if new_last:
+            write_last_sync(new_last, args.state_file)
 
-    print_sync_summary(grand_counts, days, all_errors)
+    print_sync_summary(grand_counts, days, all_errors, only)
     log.info("Done. Wrote %d total points across %d day(s).", grand_total, days)
     if all_errors:
         log.warning("Encountered %d error(s) during sync.", len(all_errors))

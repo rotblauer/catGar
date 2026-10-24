@@ -6,6 +6,10 @@
 #   # — or —
 #   git clone https://github.com/rotblauer/catGar.git && cd catGar && bash install.sh
 #
+#   # Update an existing install from this checkout (no backfill, no prompts):
+#   git pull && sudo bash install.sh update
+#   # (an install that is itself a clone: cd /opt/catgar && sudo git pull && sudo bash install.sh update)
+#
 # What it does:
 #   1. Installs system packages (python3, pip, venv)
 #   2. Clones or copies the repo to /opt/catgar
@@ -27,6 +31,54 @@ error() { printf '\033[1;31m[catGar]\033[0m %s\n' "$*" >&2; }
 if [ "$(id -u)" -ne 0 ]; then
     error "Please run as root:  sudo bash install.sh"
     exit 1
+fi
+
+case "${1:-}" in
+    ""|update) ;;
+    *) error "Unknown argument '$1'. Usage: sudo bash install.sh [update]"; exit 2 ;;
+esac
+
+# --- Update mode: copy this checkout over an existing install, nothing else ---
+# The timer runs ${INSTALL_DIR}/catgar.py, a copy: a fix in the repository reaches
+# it only through this step. Dependencies are installed (before anything is
+# copied) only when requirements.txt changed, the units only when they changed;
+# the next timer run uses the new code (no restart needed). An install that is
+# itself a clone (${INSTALL_DIR}/.git) updates in place: git pull there first.
+if [ "${1:-}" = "update" ]; then
+    cd "$(dirname "$0")"
+    [ -f "catgar.py" ] || { error "Run 'install.sh update' from a catGar checkout."; exit 1; }
+    [ -d "${INSTALL_DIR}/venv" ] || { error "No install at ${INSTALL_DIR}; run 'sudo bash install.sh' first."; exit 1; }
+    version() { { sed -n 's/^__version__ = "\(.*\)"/\1/p' "$1" 2>/dev/null || true; } | head -1; }
+    in_place=0; [ "$PWD" -ef "${INSTALL_DIR}" ] && in_place=1
+    old="$(version "${INSTALL_DIR}/catgar.py")"; new="$(version catgar.py)"
+    reqs_changed=1
+    [ "$in_place" = 0 ] && cmp -s requirements.txt "${INSTALL_DIR}/requirements.txt" && reqs_changed=0
+    if [ "$reqs_changed" = 1 ]; then
+        info "Installing dependencies from requirements.txt…"
+        "${INSTALL_DIR}/venv/bin/pip" install -r requirements.txt -q
+    fi
+    [ "$in_place" = 1 ] || cp catgar.py requirements.txt .env.example catgar.service catgar.timer "${INSTALL_DIR}/"
+    for u in catgar.service catgar.timer; do
+        cmp -s "$u" "/etc/systemd/system/$u" && continue
+        if [ -f "/etc/systemd/system/$u" ]; then
+            info "systemd unit $u changed (previous copy: ${INSTALL_DIR}/$u.bak):"
+            diff -u "/etc/systemd/system/$u" "$u" || true
+            cp "/etc/systemd/system/$u" "${INSTALL_DIR}/$u.bak"
+        else
+            info "systemd unit $u was missing: installing it."
+            enable_timer=1
+        fi
+        cp "$u" "/etc/systemd/system/$u"
+        units_changed=1
+    done
+    if [ "${units_changed:-0}" = 1 ]; then
+        systemctl daemon-reload
+        [ "${enable_timer:-0}" = 1 ] && systemctl enable --now catgar.timer
+    fi
+    info "catGar ${old:-(unversioned)} -> ${new:-(unversioned)} in ${INSTALL_DIR}."
+    "${INSTALL_DIR}/venv/bin/python" "${INSTALL_DIR}/catgar.py" --version
+    info "The next timer run uses it: systemctl list-timers catgar.timer"
+    exit 0
 fi
 
 # --- System dependencies ---
@@ -97,12 +149,17 @@ systemctl start catgar.timer
 info "catgar.timer enabled and started (runs every 4 hours)."
 
 # --- Initial backfill ---
-info "Running initial backfill (all available data). This may take a while…"
-if "${INSTALL_DIR}/venv/bin/python" "${INSTALL_DIR}/catgar.py" --backfill; then
-    info "Backfill complete!"
+if [ -f "${INSTALL_DIR}/.last_sync" ]; then
+    info "Already synced before (${INSTALL_DIR}/.last_sync): skipping the backfill."
+    info "  To force one: sudo ${INSTALL_DIR}/venv/bin/python ${INSTALL_DIR}/catgar.py --backfill"
 else
-    warn "Backfill finished with errors — run 'journalctl -u catgar.service' for details."
-    warn "The timer is still active; future syncs will resume automatically."
+    info "Running initial backfill (all available data). This may take a while…"
+    if "${INSTALL_DIR}/venv/bin/python" "${INSTALL_DIR}/catgar.py" --backfill; then
+        info "Backfill complete!"
+    else
+        warn "Backfill finished with errors — run 'journalctl -u catgar.service' for details."
+        warn "The timer is still active; future syncs will resume automatically."
+    fi
 fi
 
 info ""

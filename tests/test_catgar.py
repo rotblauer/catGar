@@ -1098,7 +1098,7 @@ class TestGetDataCatalog(unittest.TestCase):
 
     def test_catalog_returns_all_categories(self):
         catalog = get_data_catalog()
-        self.assertEqual(len(catalog), 22)
+        self.assertEqual(len(catalog), 23)
 
     def test_catalog_entry_structure(self):
         catalog = get_data_catalog()
@@ -1131,6 +1131,7 @@ class TestGetDataCatalog(unittest.TestCase):
             "endurance score", "hill score", "fitness age", "floors",
             "activities", "activity details", "activity splits",
             "activity HR zones", "activity weather", "activity track",
+            "heat & altitude acclimation",  # written by the "max metrics" pull
         }
         self.assertEqual(display_names, expected)
 
@@ -1148,7 +1149,7 @@ class TestGetDataCatalog(unittest.TestCase):
         self.assertIn("DETAILED FIELD REFERENCE", output)
         self.assertIn("USAGE NOTES", output)
         self.assertIn("daily_stats", output)
-        self.assertIn("Total data categories: 22", output)
+        self.assertIn("Total data categories: 23", output)
 
     def test_print_data_catalog_includes_all_measurements(self):
         with patch("sys.stdout", new_callable=io.StringIO) as mock_out:

@@ -14,6 +14,15 @@ Sync Garmin watch data to InfluxDB. Pulls health and activity data from Garmin C
 | `respiration`      | avg waking/sleep respiration, highest, lowest                               |
 | `spo2`             | average, lowest, latest SpO2                                                |
 
+Plus stress, HRV, hydration, training readiness and status, VO2 max
+(`max_metrics`), heat/altitude acclimation, endurance and hill score, fitness age
+and floors when your watch records them; `python catgar.py --catalog` lists every
+field.
+
+Times are stored as **local clock digits marked UTC**: a 07:05 weigh-in is stored
+at `07:05Z` whatever the zone, and a daily value at the day's `00:00Z`, so a query
+can group by local day without time-zone math.
+
 ## Prerequisites
 
 - Python 3.9+
@@ -58,7 +67,24 @@ python catgar.py --days 7
 
 # Initial backfill — all available data (up to 5 years)
 python catgar.py --backfill
+
+# Re-pull some categories only (names as in the sync summary)
+python catgar.py --days 30 --only "daily stats,sleep"
+
+# Which version is this?
+python catgar.py --version
 ```
+
+With no date or flag, catGar syncs from the day **before** the last synced day
+through today: a day's evening and that night's sleep reach Garmin Connect after
+midnight, so yesterday is re-pulled until today ends. Re-writing a day overwrites
+it in place. Only a whole run without errors moves the last synced day forward; a
+run with `--only` or a single date leaves it alone.
+
+`--only` names: daily stats, sleep, heart rate, body composition, respiration,
+SpO2, stress, HRV, hydration, training readiness, training status, max metrics
+(also writes heat/altitude acclimation), endurance score, hill score, fitness age,
+floors, activities.
 
 ### Raspberry Pi quick install
 
@@ -92,6 +118,29 @@ journalctl -u catgar.service -e
 # Trigger a manual sync
 sudo systemctl start catgar.service
 ```
+
+### Updating an existing install
+
+The timer runs the copy in `/opt/catgar`, not your checkout, so a fix reaches it
+only when you copy it over. From an up-to-date checkout:
+
+```bash
+git pull
+sudo bash install.sh update
+```
+
+`update` installs dependencies first if `requirements.txt` changed, then copies
+`catgar.py`, `requirements.txt`, `.env.example` and the unit files; changed units
+are reinstalled (the old ones kept as `/opt/catgar/*.bak`). It prints the old and
+new version and skips the credential prompts and the backfill. If `/opt/catgar`
+is itself a clone, `sudo git pull` there and run `sudo bash install.sh update`
+from it.
+
+Every run logs its version (`journalctl -u catgar.service | grep "catGar 20"`).
+To ask the installed copy (sudo: it reads the root-only `.env`):
+`sudo /opt/catgar/venv/bin/python /opt/catgar/catgar.py --version`.
+Re-running the full `sudo bash install.sh` on a machine that has synced before
+skips the backfill.
 
 ### Automate with cron (macOS / Linux)
 
