@@ -15,7 +15,7 @@ import os
 import statistics
 import sys
 from collections import Counter
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -657,10 +657,61 @@ def build_activity_weather_points(weather_data, activity_id, act_type, act_name,
     return points
 
 
+# Weigh-in keys that are identifiers or timestamps, never body metrics.
+_BODY_COMP_META_KEYS = frozenset({
+    "samplePk", "date", "calendarDate", "timestampGMT", "sourceType",
+    "from", "until", "version",
+})
+
+
+def _body_composition_records(body_data, day_str):
+    """Return ``[(timestamp, record, source_type), ...]``, one per weigh-in.
+
+    ``get_body_composition()`` (weight-service ``/weight/dateRange``) nests its
+    readings: one dict per weigh-in under ``dateWeightList`` and the period mean
+    under ``totalAverage``.  Reading ``weight`` at the top level finds nothing,
+    so before this fix no ``body_composition`` point was ever written.  A flat
+    dict (older callers, the unit tests) is still accepted.
+
+    Each weigh-in keeps its own time.  Garmin's ``date`` is the local wall-clock
+    time in epoch ms (``timestampGMT`` is the true instant), so its digits are
+    written as naive UTC, the same convention as every other catGar stamp.
+    """
+    day_ts = datetime.strptime(day_str, "%Y-%m-%d")
+    if not isinstance(body_data, dict):
+        return []
+    weigh_ins = body_data.get("dateWeightList")
+    if isinstance(weigh_ins, list) and weigh_ins:
+        records = []
+        for entry in weigh_ins:
+            if not isinstance(entry, dict):
+                continue
+            ts = None
+            local_ms = entry.get("date")
+            if isinstance(local_ms, (int, float)) and not isinstance(local_ms, bool):
+                ts = datetime.fromtimestamp(local_ms / 1000, tz=timezone.utc).replace(tzinfo=None)
+            elif isinstance(entry.get("calendarDate"), str):
+                try:
+                    ts = datetime.strptime(entry["calendarDate"], "%Y-%m-%d")
+                except ValueError:
+                    ts = None
+            records.append((ts or day_ts, entry, entry.get("sourceType")))
+        return records
+    average = body_data.get("totalAverage")
+    if isinstance(average, dict):
+        return [(day_ts, average, None)] if average.get("weight") is not None else []
+    if "dateWeightList" in body_data or "totalAverage" in body_data:
+        return []  # a nested response with no weigh-ins that day
+    return [(day_ts, body_data, None)]
+
+
 def build_body_composition_points(body_data, day_str):
-    """Convert Garmin body composition data into InfluxDB Point objects."""
+    """Convert Garmin body composition data into InfluxDB Point objects.
+
+    One point per field per weigh-in, stamped at the weigh-in's local time and
+    tagged ``source`` (``INDEX_SCALE``, ``MANUAL``, ...) when Garmin says.
+    """
     points = []
-    ts = datetime.strptime(day_str, "%Y-%m-%d")
 
     if not body_data:
         return points
@@ -676,12 +727,15 @@ def build_body_composition_points(body_data, day_str):
         "metabolicAge": "metabolic_age",
         "visceralFat": "visceral_fat",
         "weightChange": "weight_change",
+        "weightDelta": "weight_change",
         "physiqueRating": "physique_rating",
     }
 
-    for garmin_key, influx_field in field_map.items():
-        val = body_data.get(garmin_key)
-        if val is not None:
+    for ts, record, source in _body_composition_records(body_data, day_str):
+        for garmin_key, influx_field in field_map.items():
+            val = record.get(garmin_key)
+            if val is None:
+                continue
             fval = _safe_float(val, garmin_key, "body_composition")
             if fval is None:
                 continue
@@ -690,11 +744,16 @@ def build_body_composition_points(body_data, day_str):
                 .time(ts, WritePrecision.S)
                 .field(influx_field, fval)
             )
+            if source:
+                p = p.tag("source", str(source))
             points.append(p)
 
-    for key, fval in _collect_extra_fields(body_data, set(field_map), "body_composition").items():
-        p = Point("body_composition").time(ts, WritePrecision.S).field(key, fval)
-        points.append(p)
+        known = set(field_map) | _BODY_COMP_META_KEYS
+        for key, fval in _collect_extra_fields(record, known, "body_composition").items():
+            p = Point("body_composition").time(ts, WritePrecision.S).field(key, fval)
+            if source:
+                p = p.tag("source", str(source))
+            points.append(p)
 
     return points
 
